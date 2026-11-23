@@ -193,10 +193,76 @@ function build_kernel_main()
   if [[ "$ret" != 0 ]]; then
     statistics_manager 'build' "$start" "$runtime" 'failure' "$flag"
   else
-    statistics_manager 'build' "$start" "$runtime" '' "$flag"
+    build_modules_record "$start" "$runtime" "$flag"
   fi
 
   return "$ret"
+}
+
+# Print the path of the .config that the build uses.
+function get_build_config_path()
+{
+  local env_path="${options_values['ENV_PATH_KBUILD_OUTPUT_FLAG']}"
+
+  if [[ -f "${env_path}/.config" ]]; then
+    printf '%s\n' "${env_path}/.config"
+  else
+    printf '%s\n' '.config'
+  fi
+}
+
+# Count the CONFIG_*=m lines of a config file.
+function count_build_modules()
+{
+  grep -c '^CONFIG_.*=m$' "$1"
+}
+
+# Print the number of modules (CONFIG_*=m) on line 1 and their sorted,
+# comma-separated names on line 2. Without a config, 0 and an empty line.
+function build_modules_info()
+{
+  local config_path
+  local names=''
+
+  config_path="$(get_build_config_path)"
+  if [[ -f "$config_path" ]]; then
+    names="$(sed -n 's/^CONFIG_\(.*\)=m$/\1/p' "$config_path" | sort | paste -sd, -)"
+  fi
+
+  if [[ -z "$names" ]]; then
+    printf '%s\n%s\n' 0 ''
+  else
+    printf '%s\n%s\n' "$(count_build_modules "$config_path")" "$names"
+  fi
+}
+
+# Record a successful build together with its modules, honouring the same
+# disable_statistics_data_track switch as statistics_manager.
+function build_modules_record()
+{
+  local start="$1"
+  local runtime="$2"
+  local flag="$3"
+  local info
+  local start_datetime
+  local row
+
+  if [[ ${configurations[disable_statistics_data_track]} == 'yes' ]]; then
+    say "-> Execution time: $(sec_to_format "$runtime")"
+    return
+  fi
+
+  mapfile -t info < <(build_modules_info)
+  start_datetime=$(date --date @"${start}" '+%Y-%m-%d %H:%M:%S')
+  row=$(format_values_db 7 'build' 'success' "${start_datetime% *}" "${start_datetime#* }" "$runtime" "${info[0]}" "${info[1]}")
+
+  insert_into '"build_modules_report"' '("label_name","status","date","time","elapsed_time_in_secs","module_count","module_names")' "$row" '' "$flag" 2> /dev/null
+  if [[ "$?" == 0 ]]; then
+    say "-> Execution time: $(sec_to_format "$runtime")"
+  else
+    # Old database without the view: still record the build
+    statistics_manager 'build' "$start" "$runtime" 'success' "$flag"
+  fi
 }
 
 # This function retrieves and prints information related to the kernel that
@@ -207,9 +273,9 @@ function build_info()
   local kernel_name
   local kernel_version
   local compiled_modules
-  local env_path="${options_values['ENV_PATH_KBUILD_OUTPUT_FLAG']}"
-  local config_path='.config'
+  local config_path
 
+  config_path="$(get_build_config_path)"
   kernel_name=$(get_kernel_release "$flag")
   kernel_version=$(get_kernel_version "$flag")
 
@@ -217,10 +283,8 @@ function build_info()
   printf '%s\n' "  Name: $kernel_name" \
     "  Version: $kernel_version"
 
-  [[ -f "${env_path}/.config" ]] && config_path="${env_path}/.config"
-
   if [[ -f "$config_path" ]]; then
-    compiled_modules=$(grep -c '=m' "$config_path")
+    compiled_modules=$(count_build_modules "$config_path")
     printf '%s\n' "  Total modules to be compiled: $compiled_modules"
   fi
 }

@@ -155,6 +155,15 @@ function telemetry_ensure_schema()
   fi
 
   sqlite3 -init /dev/null -cmd '.timeout 5000' "$TELEMETRY_DB" 'CREATE INDEX IF NOT EXISTS event_unsent_idx ON event(id) WHERE sent_at IS NULL' < /dev/null > /dev/null 2>&1
+
+  # kwdb.sql is idempotent, so it is the single source of the extension tables.
+  # Run it only when the extension is missing from an old database.
+  if [[ -z "$(sqlite3 -init /dev/null -cmd '.timeout 5000' "$TELEMETRY_DB" "SELECT 1 FROM sqlite_master WHERE name = 'build_modules_report'" < /dev/null 2> /dev/null)" ]]; then
+    if [[ -r "${KW_DB_DIR}/kwdb.sql" ]]; then
+      sqlite3 -init /dev/null -cmd '.timeout 5000' "$TELEMETRY_DB" > /dev/null 2>&1 < "${KW_DB_DIR}/kwdb.sql"
+    fi
+  fi
+
   return 0
 }
 

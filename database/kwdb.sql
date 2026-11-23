@@ -65,6 +65,16 @@ CREATE TABLE IF NOT EXISTS "executed" (
     ON UPDATE CASCADE ON DELETE RESTRICT
 );
 
+-- Extension table: the modules (CONFIG_*=m) of a successful build. Any table
+-- keyed by an "event" id plugs into the telemetry export this way.
+CREATE TABLE IF NOT EXISTS "build_modules" (
+  "id" INTEGER NOT NULL UNIQUE PRIMARY KEY,
+  "module_count" INTEGER,
+  "module_names" TEXT,
+  FOREIGN KEY("id") REFERENCES "event"("id")
+    ON DELETE CASCADE
+);
+
 -- Table containing the information related to each pomodoro timebox
 CREATE TABLE IF NOT EXISTS "timebox" (
   "id" INTEGER NOT NULL UNIQUE,
@@ -164,6 +174,25 @@ JOIN "executed" ON "executed"."id" IS "e_id"
 JOIN "command_label" ON "command_label"."id" IS "executed"."command_label_id"
 JOIN (SELECT "id" AS "s_id", "name" AS "status_name" FROM "status") ON "s_id" IS "executed"."status_id";
 
+-- Same columns as "statistics_report" plus the build_modules ones
+CREATE VIEW IF NOT EXISTS "build_modules_report"
+AS
+SELECT
+  "e_id" AS "id",
+  "name" AS "label_name",
+  "status_name" AS "status",
+  "date",
+  "time",
+  "elapsed_time_in_secs",
+  "build_modules"."module_count" AS "module_count",
+  "build_modules"."module_names" AS "module_names"
+FROM
+  (SELECT "id" AS "e_id", "date", "time" FROM "event")
+JOIN "executed" ON "executed"."id" IS "e_id"
+JOIN "command_label" ON "command_label"."id" IS "executed"."command_label_id"
+JOIN (SELECT "id" AS "s_id", "name" AS "status_name" FROM "status") ON "s_id" IS "executed"."status_id"
+JOIN "build_modules" ON "build_modules"."id" IS "e_id";
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS "command_label_idx" ON "command_label" (
   "name" ASC,
@@ -238,6 +267,25 @@ CREATE TRIGGER IF NOT EXISTS "insert_statistics" INSTEAD OF INSERT ON "statistic
         (SELECT "id" FROM "status" AS "s" WHERE "s"."name" IS "NEW"."status"),
         "NEW"."elapsed_time_in_secs"
       );
+  END;
+
+CREATE TRIGGER IF NOT EXISTS "insert_build_modules" INSTEAD OF INSERT ON "build_modules_report"
+  BEGIN
+    INSERT OR IGNORE INTO "command_label" ("name") VALUES ("NEW"."label_name");
+    INSERT OR IGNORE INTO "status" ("name") VALUES ("NEW"."status");
+
+    INSERT INTO "event" ("date", "time") VALUES ("NEW"."date", "NEW"."time");
+
+    INSERT INTO "executed" ("id", "command_label_id", "status_id", "elapsed_time_in_secs")
+      VALUES (
+        last_insert_rowid(),
+        (SELECT "id" FROM "command_label" AS "c" WHERE "c"."name" IS "NEW"."label_name"),
+        (SELECT "id" FROM "status" AS "s" WHERE "s"."name" IS "NEW"."status"),
+        "NEW"."elapsed_time_in_secs"
+      );
+
+    INSERT INTO "build_modules" ("id", "module_count", "module_names")
+      VALUES (last_insert_rowid(), "NEW"."module_count", "NEW"."module_names");
   END;
 
 COMMIT;
