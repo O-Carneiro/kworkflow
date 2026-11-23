@@ -110,6 +110,12 @@ function kw()
 
   mkdir -p "$KW_CACHE_DIR"
 
+  # Plain `.` instead of `include`, which forks `realpath`: this runs on every
+  # command. A partial installation just skips the gate.
+  if [[ -r "${KW_LIB_DIR}/lib/telemetry.sh" ]]; then
+    . "${KW_LIB_DIR}/lib/telemetry.sh" --source-only && telemetry_gate "$action"
+  fi
+
   case "$action" in
     init)
       (
@@ -266,6 +272,13 @@ function kw()
         include "${KW_LIB_DIR}/patch_hub.sh"
 
         patch_hub_main "$@"
+      )
+      ;;
+    telemetry)
+      (
+        include "${KW_LIB_DIR}/telemetry.sh"
+
+        telemetry_main "$@"
       )
       ;;
     clear-cache)

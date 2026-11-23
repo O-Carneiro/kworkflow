@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+
+# Test double for kw_tele. Appends one line per call to "$KW_TELE_STUB_DIR/record"
+# and answers from optional control files in the same directory:
+#   exit / exit.<subcommand>      exit code (default 0)
+#   stdout / stdout.<subcommand>  text printed on stdout
+#   hang                          seconds to stay alive after recording
+
+dir="${KW_TELE_STUB_DIR:?KW_TELE_STUB_DIR is not set}"
+sub="$1"
+read -r -a stat_fields < /proc/self/stat
+parent_cmdline=''
+if [[ -r "/proc/${stat_fields[3]}/cmdline" ]]; then
+  parent_cmdline="$(tr '\0' ' ' < "/proc/${stat_fields[3]}/cmdline")"
+fi
+
+printf 'argv=%s\targc=%s\tKW_DATA_DIR=%s\tKW_STATE_DIR=%s\tKW_TELE_CONFIG=%s\tKW_VERSION=%s\tsid=%s\tparent=%s\tnow=%s\tstdin=%s\tstdout=%s\tstderr=%s\n' \
+  "$*" "$#" "${KW_DATA_DIR-<unset>}" "${KW_STATE_DIR-<unset>}" "${KW_TELE_CONFIG-<unset>}" \
+  "${KW_VERSION-<unset>}" "${stat_fields[5]}" "$parent_cmdline" "${KW_TELE_NOW-<unset>}" \
+  "$(readlink /proc/$$/fd/0)" "$(readlink /proc/$$/fd/1)" "$(readlink /proc/$$/fd/2)" >> "${dir}/record"
+
+for file in "${dir}/stdout.${sub}" "${dir}/stdout"; do
+  if [[ -r "$file" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      printf '%s\n' "$line"
+    done < "$file"
+    break
+  fi
+done
+
+if [[ -r "${dir}/hang" ]]; then
+  read -r seconds < "${dir}/hang"
+  sleep "$seconds"
+fi
+
+code=0
+for file in "${dir}/exit.${sub}" "${dir}/exit"; do
+  if [[ -r "$file" ]]; then
+    read -r code < "$file"
+    break
+  fi
+done
+exit "$code"

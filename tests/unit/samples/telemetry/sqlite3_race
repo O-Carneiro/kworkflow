@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+
+# sqlite3 wrapper simulating a concurrent kw process that wins the race on
+# "ALTER TABLE ... ADD COLUMN": the ALTER is applied, but this call reports a
+# failure on stderr, as sqlite3 does for a duplicate column.
+
+input=''
+if [[ ! -t 0 ]]; then
+  input="$(< /dev/stdin)"
+fi
+
+if [[ "$*" == *'ALTER TABLE'* || "$input" == *'ALTER TABLE'* ]]; then
+  if [[ "${TELE_RACE_APPLY:-1}" == 1 ]]; then
+    "$TELE_REAL_SQLITE" "$@" <<< "$input" > /dev/null 2>&1
+  fi
+  printf '%s\n' 'Error: duplicate column name: sent_at' >&2
+  exit 1
+fi
+
+exec "$TELE_REAL_SQLITE" "$@" <<< "$input"

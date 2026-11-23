@@ -16,7 +16,7 @@ function _kw_autocomplete()
   kw_options['kw']='init build deploy bd diff ssh codestyle self-update
                     maintainers kernel-config-manager config remote explore
                     pomodoro report device backup debug send-patch env patch-hub
-                    clear-cache drm vm version man help'
+                    telemetry clear-cache drm vm version man help'
 
   kw_options['init']='--arch --remote --target --force --template --verbose'
 
@@ -78,6 +78,8 @@ function _kw_autocomplete()
   kw_options['env']='--list --create --use --exit-env --destroy --verbose'
 
   kw_options['patch-hub']='--help'
+
+  kw_options['telemetry']='upload consent opt-in opt-out info config'
 
   kw_options['drm']='--remote --local --gui-on --gui-off --gui-on-after-reboot --gui-off-after-reboot
                      --load-module --unload-module --conn-available --modes --verbose --help'

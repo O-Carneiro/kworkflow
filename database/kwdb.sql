@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS "event" (
   "id" INTEGER NOT NULL UNIQUE,
   "date" TEXT NOT NULL,
   "time" TEXT,
+  -- NULL when the event is pending upload by `kw telemetry`, -1 when it is
+  -- excluded from it, otherwise the epoch of the upload that accepted it
+  "sent_at" INTEGER,
   PRIMARY KEY("id")
 );
 

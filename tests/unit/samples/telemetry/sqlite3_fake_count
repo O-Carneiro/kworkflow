@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+
+# sqlite3 wrapper for the gate's COUNT query: records its argv to
+# "$TELE_SQLITE_RECORD" and prints $TELE_FAKE_COUNT instead of querying. Any
+# other call goes to the real sqlite3 untouched, stdin included.
+
+if [[ "$*" == *'COUNT(*)'* ]]; then
+  printf '%s\n' "$@" > "${TELE_SQLITE_RECORD:?}"
+  printf '%s\n' "${TELE_FAKE_COUNT-}"
+  exit "${TELE_FAKE_EXIT:-0}"
+fi
+
+exec "${TELE_REAL_SQLITE:?}" "$@"

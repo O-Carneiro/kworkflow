@@ -82,6 +82,14 @@ on patch-reviewing.
 
   :ref:`kw-patch-hub<patch-hub-doc>`
 
+COMMAND TO SHARE USAGE TELEMETRY
+--------------------------------
+
+With your consent, kw can send data about how it is used to a collector, so
+its developers learn which features matter. Nothing is sent until you opt in.
+
+  :ref:`kw-telemetry<telemetry-doc>`
+
 OTHER COMMANDS
 --------------
 This section describes a tool available in **kw** to help developers keep track

@@ -43,6 +43,7 @@ _kw()
     'self-update:kw self-update mechanism'
     'ssh:SSH support'
     'patch-hub: Open UI with lore.kernel.org archives'
+    'telemetry:Manage the sharing of kw usage telemetry'
     'version:Show kw version'
   )
 
@@ -408,7 +409,7 @@ _kw_man()
   _values 'kw commands' \
     'backup' 'bd' 'build' 'codestyle' 'config' 'debug' 'deploy' 'device' 'diff' 'drm' 'env' \
     'explore' 'init' 'send-patch' 'maintainers' 'pomodoro' 'remote' 'report' 'self-update' 'ssh' \
-    'patch-hub' 
+    'patch-hub' 'telemetry'
 }
 
 _kw_p() { _kw_pomodoro }
@@ -507,6 +508,24 @@ _kw_ssh()
 _kw_patch-hub()
 {
   _nothing
+}
+
+_kw_telemetry()
+{
+  local -a subcommands=(
+    'upload:upload the pending events now'
+    'consent:show or change the consent'
+    'opt-in:enable telemetry'
+    'opt-out:disable telemetry'
+    'info:show what is collected and sent'
+    'config:show or change the settings'
+  )
+
+  if [[ "$CURRENT" -gt 2 ]]; then
+    _nothing
+  else
+    _describe -t kw-telemetry-commands 'telemetry subcommand' subcommands
+  fi
 }
 
 _kw_version()

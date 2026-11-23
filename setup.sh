@@ -55,6 +55,9 @@ declare -r DOCS_VIRTUAL_ENV='docs_virtual_env'
 # patch-hub latest release endpoint
 declare -r PATCH_HUB_LATEST_RELEASE='https://github.com/kworkflow/patch-hub/releases/latest/download/patch-hub-x86_64-unknown-linux-gnu.tar.xz'
 
+# kw_tele latest release endpoint
+declare -r KW_TELE_LATEST_RELEASE='https://github.com/kworkflow/kw_tele/releases/latest/download/kw_tele'
+
 # This function identifies the missing packages required by the distribution.
 #
 # @distro: The distribution name (arch, debian, fedora, etc.)
@@ -438,6 +441,9 @@ function clean_legacy()
   # Remove patch-hub binary
   [[ -f "${binpath}/patch-hub" ]] && mv "${binpath}/patch-hub" "$trash"
 
+  # Remove kw_tele binary
+  [[ -f "${binpath}/kw_tele" ]] && mv "${binpath}/kw_tele" "$trash"
+
   # Completely remove user data
   if [[ "$completely_remove" =~ '-d' ]]; then
     mv "$datadir" "$trash/userdata"
@@ -684,6 +690,14 @@ function install_home()
     warning '   Install instructions: https://github.com/kworkflow/patch-hub?tab=readme-ov-file#package-how-to-install.'
   fi
 
+  install_kw_tele
+  if [[ "$?" != 0 ]]; then
+    warning ''
+    warning '-> Could not install `kw_tele`.'
+    warning '   To use the `kw telemetry` feature, you will need to install the `kw_tele` executable.'
+    warning '   Either try re-running this script or set KW_TELE_PATH to a kw_tele checkout.'
+  fi
+
   warning ''
   warning '-> For a better experience with kw, please, open a new terminal.'
 }
@@ -715,6 +729,37 @@ function install_patch_hub()
   if [[ "$?" != 0 ]]; then
     return "$ret"
   fi
+}
+
+# Install `kw_tele`, either by building it from the checkout in KW_TELE_PATH or
+# by downloading the latest release.
+#
+# Return:
+# 0 if successful; non-zero otherwise
+function install_kw_tele()
+{
+  local tmp_dir
+  local ret
+
+  say ''
+  say 'Installing `kw_tele`...'
+
+  if [[ -n "$KW_TELE_PATH" ]]; then
+    "${KW_TELE_PATH}/build.sh" "${binpath}/kw_tele"
+    return "$?"
+  fi
+
+  tmp_dir="$(mktemp --directory)" || return "$?"
+
+  curl --fail --silent --location --output "${tmp_dir}/kw_tele" "$KW_TELE_LATEST_RELEASE"
+  ret="$?"
+  if [[ "$ret" == 0 ]]; then
+    install --mode=755 "${tmp_dir}/kw_tele" "${binpath}/kw_tele"
+    ret="$?"
+  fi
+
+  rm --recursive --force "$tmp_dir"
+  return "$ret"
 }
 
 function full_installation()

@@ -18,7 +18,7 @@ function get_sorted_completions()
 
 function test_kw_completion_for_fish()
 {
-  local kw_options='init build b deploy d bd diff df ssh s self-update u maintainers m kernel-config-manager k config g remote explore e pomodoro p report r device backup debug send-patch env patch-hub drm vm clear-cache codestyle c version v man help h'
+  local kw_options='init build b deploy d bd diff df ssh s self-update u maintainers m kernel-config-manager k config g remote explore e pomodoro p report r device backup debug send-patch env patch-hub telemetry drm vm clear-cache codestyle c version v man help h'
   local sorted_kw_options="$(printf "${kw_options}" | awk '{gsub(" ", "\n"); print $0}' | sort --dictionary-order)"
   local sorted_kw_fish_completions="$(get_sorted_completions 'kw')"
 

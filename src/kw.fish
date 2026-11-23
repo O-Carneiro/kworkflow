@@ -72,6 +72,9 @@ complete -c kw -n "__fish_seen_subcommand_from env" -l list -l create -l use -l 
 complete -c kw -n "__fish_kw_no_commands" -a "patch-hub" -d "Patch hub"
 complete -c kw -n "__fish_seen_subcommand_from patch-hub"  -l help
 
+complete -c kw -n "__fish_kw_no_commands" -a "telemetry" -d "Usage telemetry"
+complete -c kw -n "__fish_seen_subcommand_from telemetry" -a "upload consent opt-in opt-out info config"
+
 complete -c kw -n "__fish_kw_no_commands" -a "drm" -d "Drm helpers"
 complete -c kw -n "__fish_seen_subcommand_from drm" -l remote -l local -l gui-on -l gui-off -l gui-on-after-reboot -l gui-off-after-reboot -l load-module -l unload-module -l conn-available -l modes -l verbose -l help
 
