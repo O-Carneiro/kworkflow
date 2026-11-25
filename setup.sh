@@ -413,6 +413,7 @@ function legacy_folders()
 function clean_legacy()
 {
   local completely_remove="$1"
+  local keep_kw_tele="$2"
   local toDelete="$app_name"
   local trash
 
@@ -441,8 +442,12 @@ function clean_legacy()
   # Remove patch-hub binary
   [[ -f "${binpath}/patch-hub" ]] && mv "${binpath}/patch-hub" "$trash"
 
-  # Remove kw_tele binary
-  [[ -f "${binpath}/kw_tele" ]] && mv "${binpath}/kw_tele" "$trash"
+  # On reinstall the old kw_tele stays until a new one is installed, so a failed
+  # download does not leave the user without it
+  if [[ -z "$keep_kw_tele" ]]; then
+    # Remove kw_tele binary
+    [[ -f "${binpath}/kw_tele" ]] && mv "${binpath}/kw_tele" "$trash"
+  fi
 
   # Completely remove user data
   if [[ "$completely_remove" =~ '-d' ]]; then
@@ -670,7 +675,7 @@ function install_home()
   # Move old folder structure to new one
   legacy_folders
   # First clean old installation
-  clean_legacy
+  clean_legacy '' keep_kw_tele
   # Synchronize source files
   say 'Installing ...'
   synchronize_files

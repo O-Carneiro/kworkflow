@@ -245,7 +245,7 @@ function build_modules_record()
   local flag="$3"
   local info
   local start_datetime
-  local row
+  local db_path
 
   if [[ ${configurations[disable_statistics_data_track]} == 'yes' ]]; then
     say "-> Execution time: $(sec_to_format "$runtime")"
@@ -254,10 +254,19 @@ function build_modules_record()
 
   mapfile -t info < <(build_modules_info)
   start_datetime=$(date --date @"${start}" '+%Y-%m-%d %H:%M:%S')
-  row=$(format_values_db 7 'build' 'success' "${start_datetime% *}" "${start_datetime#* }" "$runtime" "${info[0]}" "${info[1]}")
+  db_path="$(join_path "$KW_DATA_DIR" "$DB_NAME")"
 
-  insert_into '"build_modules_report"' '("label_name","status","date","time","elapsed_time_in_secs","module_count","module_names")' "$row" '' "$flag" 2> /dev/null
-  if [[ "$?" == 0 ]]; then
+  # Like cmd_manager: show the command and leave the database alone
+  if [[ "$flag" == 'TEST_MODE' ]]; then
+    say "sqlite3 ${db_path} INSERT INTO \"build_modules_report\" ..."
+    return 0
+  fi
+
+  # The statement goes through stdin: with thousands of modules it would not fit
+  # in one argument, and it is never evaluated by a shell. The names are quoted
+  # by hand, so a name that looks like an SQL function call stays a string.
+  if [[ -f "$db_path" ]] && printf '%s\n' "INSERT INTO \"build_modules_report\" (\"label_name\",\"status\",\"date\",\"time\",\"elapsed_time_in_secs\",\"module_count\",\"module_names\") VALUES ('build','success','${start_datetime% *}','${start_datetime#* }','${runtime}','${info[0]}','${info[1]//\'/\'\'}');" |
+    sqlite3 -init "${KW_DB_DIR}/pre_cmd.sql" "$db_path" -bail -batch > /dev/null 2>&1; then
     say "-> Execution time: $(sec_to_format "$runtime")"
   else
     # Old database without the view: still record the build

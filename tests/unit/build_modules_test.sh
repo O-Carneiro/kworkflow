@@ -321,4 +321,168 @@ function test_build_modules_info_empty_config()
   assertEquals "($LINENO) names" '' "${lines[1]:-}"
 }
 
+# ------------------------------------------------- hostile and huge module names
+
+# @name: module name as it appears after CONFIG_ and before =m
+# Records a build whose .config holds a benign module and the given one. Nothing
+# may run, the build must still be recorded, and the name is stored verbatim
+# (or skipped).
+function assert_hostile_name_is_inert()
+{
+  local line="$1"
+  local name="$2"
+  local stored
+  local sorted_stored
+  local sorted_full
+
+  make_db
+  rm -f "${TD}/PWNED"
+  printf '%s\n' 'CONFIG_AAA=m' "CONFIG_${name}=m" > "${FAKE_KERNEL}/.config"
+  run_build
+  assertEquals "(${line}) build status" 0 "$?"
+  assertFalse "(${line}) nothing was executed" "[[ -e ${TD}/PWNED ]]"
+  assertEquals "(${line}) event" '1' "$(db_query 'SELECT count(*) FROM event')"
+  assertEquals "(${line}) schema intact" '1' "$(db_query "SELECT count(*) FROM sqlite_master WHERE name = 'event'")"
+  stored="$(db_query 'SELECT module_names FROM build_modules')"
+  # build_modules_info sorts the names, so compare as a set
+  sorted_stored="$(tr ',' '\n' <<< "$stored" | sort | paste -sd, -)"
+  sorted_full="$(printf '%s\n' AAA "$name" | sort | paste -sd, -)"
+  if [[ "$sorted_stored" != "$sorted_full" && "$stored" != 'AAA' ]]; then
+    fail "(${line}) names neither verbatim nor skipped: ${stored}"
+  fi
+}
+
+function test_build_modules_name_with_command_substitution_is_not_executed()
+{
+  assert_hostile_name_is_inert "$LINENO" "B\$(touch ${TD}/PWNED)"
+}
+
+function test_build_modules_name_with_backticks_is_not_executed()
+{
+  assert_hostile_name_is_inert "$LINENO" "B\`touch ${TD}/PWNED\`"
+}
+
+function test_build_modules_name_with_double_quote_and_semicolon_is_not_executed()
+{
+  assert_hostile_name_is_inert "$LINENO" "B\"; touch ${TD}/PWNED; echo \""
+}
+
+function test_build_modules_name_with_single_quote_is_not_executed()
+{
+  assert_hostile_name_is_inert "$LINENO" "B'; DROP TABLE event; touch ${TD}/PWNED; --"
+}
+
+function test_build_modules_name_with_spaces_and_redirections_is_not_executed()
+{
+  assert_hostile_name_is_inert "$LINENO" "A B > ${TD}/PWNED | cat & \${HOME}"
+}
+
+function test_build_modules_very_long_name_is_recorded_without_executing()
+{
+  local name
+
+  printf -v name '%*s' 5000 ''
+  name="${name// /L}"
+  assert_hostile_name_is_inert "$LINENO" "$name"
+}
+
+# The whole statement used to travel as one sqlite3 argument, above the 128 KiB
+# limit of a single argument.
+function make_big_config()
+{
+  local i
+
+  for ((i = 0; i < 7000; i++)); do
+    printf 'CONFIG_BIGMODULE_NAME_%05d=m\n' "$i"
+  done > "${FAKE_KERNEL}/.config"
+}
+
+function test_build_with_thousands_of_modules_still_records_the_row()
+{
+  make_db
+  make_big_config
+  run_build
+  assertEquals "($LINENO) status" 0 "$?"
+  assertEquals "($LINENO) event" '1' "$(db_query 'SELECT count(*) FROM event')"
+  assertEquals "($LINENO) row" '7000' "$(db_query 'SELECT module_count FROM build_modules')"
+  assertEquals "($LINENO) names" '7000' "$(db_query "SELECT length(module_names) - length(replace(module_names, ',', '')) + 1 FROM build_modules")"
+}
+
+function test_verbose_build_does_not_print_every_module_name()
+{
+  make_db
+  make_big_config
+  (build_kernel_main 'VERBOSE') > "${TD}/build.out" 2> "${TD}/build.err" < /dev/null
+  assertEquals "($LINENO) status" 0 "$?"
+  assertEquals "($LINENO) row recorded" '1' "$(db_query 'SELECT count(*) FROM build_modules')"
+  assertFalse "($LINENO) stdout lists module names" "grep -q BIGMODULE_NAME_00042 ${TD}/build.out"
+  assertFalse "($LINENO) stderr lists module names" "grep -q BIGMODULE_NAME_00042 ${TD}/build.err"
+}
+
+function test_build_modules_name_starting_a_sqlite_dot_command_is_inert()
+{
+  assert_hostile_name_is_inert "$LINENO" ".shell touch ${TD}/PWNED"
+}
+
+function test_build_modules_name_with_dot_import_is_inert()
+{
+  assert_hostile_name_is_inert "$LINENO" ".import /etc/hostname event"
+}
+
+function test_build_modules_name_with_sql_comment_dashes_is_inert()
+{
+  assert_hostile_name_is_inert "$LINENO" "A--B"
+}
+
+function test_build_modules_name_with_carriage_return_is_inert()
+{
+  assert_hostile_name_is_inert "$LINENO" $'A\r.shell touch '"${TD}/PWNED"
+}
+
+function test_build_modules_name_with_backslash_is_inert()
+{
+  assert_hostile_name_is_inert "$LINENO" 'A\nB\$(touch '"${TD}/PWNED"')'
+}
+
+function test_build_records_the_row_when_the_database_path_has_a_space()
+{
+  local dir="${TD}/dir with space"
+
+  make_db
+  mkdir -p "$dir"
+  mv "$TELE_DB" "${dir}/kw.db"
+  KW_DATA_DIR="$dir"
+  write_fake_config "${FAKE_KERNEL}/.config"
+  run_build
+  assertEquals "($LINENO) status" 0 "$?"
+  assertEquals "($LINENO) row" '3|AAA,MID_X,ZED' \
+    "$(sqlite3 "${dir}/kw.db" "SELECT module_count || '|' || module_names FROM build_modules")"
+}
+
+# Without the view the build still reaches statistics_report and no
+# build_modules row exists.
+function test_build_without_the_report_view_falls_back_and_keeps_the_build()
+{
+  make_db
+  sqlite3 "$TELE_DB" 'DROP VIEW build_modules_report;'
+  write_fake_config "${FAKE_KERNEL}/.config"
+  run_build
+  assertEquals "($LINENO) status" 0 "$?"
+  assertEquals "($LINENO) build kept" 'build|success' "$(db_query 'SELECT label_name || char(124) || status FROM statistics_report')"
+  assertEquals "($LINENO) no modules row" '0' "$(db_query 'SELECT count(*) FROM build_modules')"
+}
+
+# TEST_MODE only prints what would run (see cmd_manager), so nothing may be
+# written to the database.
+function test_build_in_test_mode_writes_nothing_to_the_database()
+{
+  make_db
+  write_fake_config "${FAKE_KERNEL}/.config"
+  (build_kernel_main 'TEST_MODE') > "${TD}/build.out" 2> "${TD}/build.err" < /dev/null
+  assertEquals "($LINENO) status" 0 "$?"
+  assertEquals "($LINENO) build_modules" '0' "$(db_query 'SELECT count(*) FROM build_modules')"
+  assertEquals "($LINENO) executed" '0' "$(db_query 'SELECT count(*) FROM executed')"
+  assertEquals "($LINENO) event" '0' "$(db_query 'SELECT count(*) FROM event')"
+}
+
 invoke_shunit

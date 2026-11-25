@@ -235,8 +235,9 @@ function telemetry_prompt_consent()
   printf '%s\n' \
     '' \
     'kw can share usage telemetry with its developers.' \
-    '  - What is sent: one record per kw event, with the command, its status' \
-    '    and duration, and the pomodoro tag and description.' \
+    '  - What is sent: the usage events kw records in the tables of its' \
+    '    local database, including tables added later. To see what is' \
+    '    recorded, run `kw telemetry info`.' \
     "  - Where it goes: ${prompt_config[endpoint]}" \
     '  - Each installation is identified by a random ID.' \
     '  - Data that was already sent stays on the server.' \
@@ -362,6 +363,11 @@ function telemetry_gate()
     now=-1
   fi
   ((now < 0)) && printf -v now '%(%s)T' -1
+
+  # a timestamp in the future (clock jump, copied state) would block the gate
+  ((last_attempt > now)) && last_attempt=0
+  ((last_success > now)) && last_success=0
+  ((spawned_at > now)) && spawned_at=0
 
   gap="$backoff"
   if ((failures > 0)); then

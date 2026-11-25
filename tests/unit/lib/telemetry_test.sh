@@ -1442,4 +1442,73 @@ function test_prompt_does_not_touch_the_config_file_itself()
   assert_equals_helper 'config' "$LINENO" 'telemetry_consent=ask' "$(< "$TELE_CONFIG")"
 }
 
+# The consent text must not name the fields: the data is whatever kw's own
+# tables hold, now and later.
+function test_prompt_does_not_enumerate_a_fixed_field_list()
+{
+  local flat
+
+  run_prompt '3\n'
+  flat="${TELE_PTY_OUT//$'\n'/ }"
+  flat="$(tr -s ' ' <<< "$flat")"
+  assert_lacks "$LINENO" 'hard-coded field list' "$flat" 'its status'
+  assert_lacks "$LINENO" 'hard-coded field list' "$flat" 'pomodoro tag'
+  assert_lacks "$LINENO" 'hard-coded field list' "$flat" 'the command,'
+}
+
+function test_prompt_describes_the_local_database_tables_as_the_data_sent()
+{
+  local flat
+
+  run_prompt '3\n'
+  flat="${TELE_PTY_OUT//$'\n'/ }"
+  flat="$(tr -s ' ' <<< "$flat")"
+  assert_has "$LINENO" 'source of the data' "$flat" 'local database'
+  assert_has "$LINENO" 'tables, also future ones' "$flat" 'tables'
+  assert_has "$LINENO" 'tables added later' "$flat" 'added later'
+  assert_has "$LINENO" 'where to see specifics' "$flat" 'kw telemetry info'
+}
+
+function test_prompt_still_says_what_consent_allows_and_how_to_opt_out()
+{
+  local flat
+
+  run_prompt '3\n'
+  flat="$(tr -s ' ' <<< "${TELE_PTY_OUT//$'\n'/ }")"
+  assert_has "$LINENO" 'what is sent' "$flat" 'What is sent'
+  assert_has "$LINENO" 'dry run' "$flat" 'kw telemetry upload --dry-run'
+  assert_has "$LINENO" 'opt-out' "$flat" 'kw telemetry opt-out'
+  assert_has "$LINENO" 'opt-in' "$flat" 'kw telemetry opt-in'
+  assert_has "$LINENO" 'random id' "$flat" 'random ID'
+}
+
+# A last_success_at in the future (clock jump, copied state) must not keep the
+# gate from spawning.
+function test_gate_a_future_last_success_does_not_block_spawning()
+{
+  tele_consent_yes
+  tele_write_state 0 $((TELE_NOW + 864000)) 0
+  run_gate build "$LINENO"
+  assert_gate_outcome "$LINENO" spawned 'last_success_at ten days ahead of now'
+}
+
+# A last_attempt_at in the future would otherwise space out attempts forever.
+function test_gate_a_future_last_attempt_does_not_block_spawning()
+{
+  tele_consent_yes
+  tele_write_state $((TELE_NOW + 864000)) 0 0
+  run_gate build "$LINENO"
+  assert_gate_outcome "$LINENO" spawned 'last_attempt_at ten days ahead of now'
+}
+
+# The spawn file is written by kw itself, so a bad clock must not block it either.
+function test_gate_a_future_spawn_file_value_does_not_block_spawning()
+{
+  tele_consent_yes
+  tele_write_state 0 0 0
+  printf '%s\n' $((TELE_NOW + 864000)) > "${TELE_STATE_DIR}/telemetry.spawn"
+  run_gate build "$LINENO"
+  assert_gate_outcome "$LINENO" spawned 'spawn file ten days ahead of now'
+}
+
 invoke_shunit
