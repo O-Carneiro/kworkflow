@@ -191,7 +191,7 @@ function build_kernel_main()
   runtime=$((end - start))
 
   if [[ "$ret" != 0 ]]; then
-    statistics_manager 'build' "$start" "$runtime" 'failure' "$flag"
+    build_modules_record "$start" "$runtime" "$flag" build failure
   else
     build_modules_record "$start" "$runtime" "$flag"
   fi
@@ -236,13 +236,23 @@ function build_modules_info()
   fi
 }
 
-# Record a successful build together with its modules, honouring the same
+# Record a command outcome together with its modules, honouring the same
 # disable_statistics_data_track switch as statistics_manager.
+#
+# @start:   Start time, in epoch seconds
+# @runtime: Duration in seconds
+# @flag:    How to display a command
+# @label:   Command label, default is build
+# @status:  success or failure, default is success
+# @modules: With `none`, record 0 modules and no names without reading .config
 function build_modules_record()
 {
   local start="$1"
   local runtime="$2"
   local flag="$3"
+  local label="${4:-build}"
+  local status="${5:-success}"
+  local modules="${6:-}"
   local info
   local start_datetime
   local db_path
@@ -252,7 +262,11 @@ function build_modules_record()
     return
   fi
 
-  mapfile -t info < <(build_modules_info)
+  if [[ "$modules" == none ]]; then
+    info=(0 '')
+  else
+    mapfile -t info < <(build_modules_info)
+  fi
   start_datetime=$(date --date @"${start}" '+%Y-%m-%d %H:%M:%S')
   db_path="$(join_path "$KW_DATA_DIR" "$DB_NAME")"
 
@@ -265,12 +279,12 @@ function build_modules_record()
   # The statement goes through stdin: with thousands of modules it would not fit
   # in one argument, and it is never evaluated by a shell. The names are quoted
   # by hand, so a name that looks like an SQL function call stays a string.
-  if [[ -f "$db_path" ]] && printf '%s\n' "INSERT INTO \"build_modules_report\" (\"label_name\",\"status\",\"date\",\"time\",\"elapsed_time_in_secs\",\"module_count\",\"module_names\") VALUES ('build','success','${start_datetime% *}','${start_datetime#* }','${runtime}','${info[0]}','${info[1]//\'/\'\'}');" |
+  if [[ -f "$db_path" ]] && printf '%s\n' "INSERT INTO \"build_modules_report\" (\"label_name\",\"status\",\"date\",\"time\",\"elapsed_time_in_secs\",\"module_count\",\"module_names\") VALUES ('${label}','${status}','${start_datetime% *}','${start_datetime#* }','${runtime}','${info[0]}','${info[1]//\'/\'\'}');" |
     sqlite3 -init "${KW_DB_DIR}/pre_cmd.sql" "$db_path" -bail -batch > /dev/null 2>&1; then
     say "-> Execution time: $(sec_to_format "$runtime")"
   else
-    # Old database without the view: still record the build
-    statistics_manager 'build' "$start" "$runtime" 'success' "$flag"
+    # Old database without the view: still record the outcome
+    statistics_manager "$label" "$start" "$runtime" "$status" "$flag"
   fi
 }
 

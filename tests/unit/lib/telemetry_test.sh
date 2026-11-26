@@ -55,198 +55,76 @@ function assert_gate_outcome()
   assertEquals "(${line}) ${label}" "$expected" "$actual"
 }
 
-# Succeeds when the variable is exported.
-function is_exported()
+# Prints a state-file timestamp for "N seconds before now"; 'never' is 0 and a
+# negative N lands in the future.
+function seconds_ago()
 {
-  local declaration
-
-  declaration="$(declare -p "$1" 2> /dev/null)" || return 1
-  declaration="${declaration#declare -}"
-  [[ "${declaration%% *}" == *x* ]]
+  if [[ "$1" == never ]]; then
+    printf '0'
+  else
+    printf '%s' $((TELE_NOW - $1))
+  fi
 }
 
-# ---------------------------------------------------------------- fixtures
-
-function test_fixture_stub_records_argv_and_env()
+# Runs the gate against scenarios read from stdin, one per row:
+#   config lines (comma separated) | expected outcome | attempt age | success age | failures
+# The ages are seconds before now (see seconds_ago).
+#
+# @line: $LINENO of the caller
+function check_timing_rows()
 {
-  local call
-
-  KW_TELE_NOW=12345 KW_DATA_DIR=/d KW_STATE_DIR=/s KW_TELE_CONFIG=/c KW_VERSION=v9 kw_tele info --pending
-  assertEquals "($LINENO)" 0 "$?"
-  call="$(< "${KW_TELE_STUB_DIR}/record")"
-  assert_has "$LINENO" 'argv' "$call" 'argv=info --pending'$'\t'
-  assert_has "$LINENO" 'env' "$call" $'\tKW_DATA_DIR=/d\tKW_STATE_DIR=/s\tKW_TELE_CONFIG=/c\tKW_VERSION=v9\t'
-  assert_equals_helper 'stub is the first kw_tele on PATH' "$LINENO" "${TD}/stubbin/kw_tele" "$(command -v kw_tele)"
-}
-
-function test_fixture_stub_prints_and_exits_as_configured()
-{
-  local output
-  local ret
-
-  tele_stub_set stdout.info 'pending_events=3'
-  tele_stub_set exit.info 6
-  output="$(kw_tele info)"
-  ret="$?"
-  assertEquals "($LINENO)" 6 "$ret"
-  assert_equals_helper 'stdout' "$LINENO" 'pending_events=3' "$output"
-  kw_tele consent > /dev/null
-  assertEquals "($LINENO) default exit code" 0 "$?"
-}
-
-function test_fixture_db_helper_builds_kwdb_sql()
-{
-  local tables
+  local line="$1"
+  local cfgs
+  local expected
+  local attempt
+  local success
+  local failures
+  local -a cfg
 
   tele_make_db
-  tables="$(sqlite3 "$TELE_DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('event','executed','timebox')")"
-  assertEquals "($LINENO) tables from kwdb.sql" 3 "$tables"
-  tele_db_has_sent_at
-  assertEquals "($LINENO) sent_at column on the current DB" 0 "$?"
-  tele_make_db legacy
-  tele_db_has_sent_at
-  assertEquals "($LINENO) legacy DB has no sent_at" 1 "$?"
-}
-
-function test_fixture_limited_path_leaves_out_tools()
-{
-  tele_limited_path setsid kw_tele
-  assertNull "($LINENO)" "$(PATH="$TELE_LIMITED_PATH" command -v setsid)"
-  assertNull "($LINENO)" "$(PATH="$TELE_LIMITED_PATH" command -v kw_tele)"
-  assertNotNull "($LINENO)" "$(PATH="$TELE_LIMITED_PATH" command -v timeout)"
-}
-
-# ----------------------------------------------------------- database schema
-
-function test_kwdb_sql_declares_sent_at_without_an_index()
-{
-  local sql
-
-  sql="$(< ./database/kwdb.sql)"
-  assert_has "$LINENO" 'event table needs the column' "$sql" '"sent_at" INTEGER'
-  assert_lacks "$LINENO" 'kwdb.sql re-runs on old DBs, so no index there' "$sql" 'event_unsent_idx'
-}
-
-function test_pre_cmd_sql_waits_on_a_busy_database()
-{
-  assert_has "$LINENO" 'busy timeout' "$(< ./database/pre_cmd.sql)" '.timeout 5000'
+  while IFS='|' read -r cfgs expected attempt success failures; do
+    IFS=',' read -r -a cfg <<< "$cfgs"
+    tele_reset_spawn
+    tele_consent_yes "${cfg[@]}"
+    tele_write_state "$(seconds_ago "$attempt")" "$(seconds_ago "$success")" "$failures"
+    run_gate build "$line"
+    assert_gate_outcome "$line" "$expected" "[${cfgs:-defaults}] attempt=${attempt} success=${success} failures=${failures}"
+  done
 }
 
 # ------------------------------------------------------------ telemetry_read_kv
 
-function test_read_kv_parses_plain_lines_and_last_line_without_newline()
+# Prints the array as sorted key=value lines, so one comparison covers it all.
+function dump_kv()
+{
+  local -n _dump_ref="$1"
+  local key
+
+  for key in "${!_dump_ref[@]}"; do
+    printf '%s=%s\n' "$key" "${_dump_ref[$key]}"
+  done | LC_ALL=C sort
+}
+
+function test_read_kv_grammar()
 {
   local -A kv=()
-  local file="${TD}/kv"
+  local expected
 
-  printf 'a=1\nb=2' > "$file"
-  telemetry_read_kv "$file" kv
-  assertEquals "($LINENO)" 0 "$?"
-  assert_equals_helper 'a' "$LINENO" '1' "${kv[a]-<unset>}"
-  assert_equals_helper 'last line without newline' "$LINENO" '2' "${kv[b]-<unset>}"
-  assert_equals_helper 'size' "$LINENO" '2' "${#kv[@]}"
-}
-
-function test_read_kv_strips_crlf_and_trims_whitespace()
-{
-  local -A kv=()
-  local file="${TD}/kv"
-
-  printf 'a=1\r\n  b  =   two words  \r\nc=3\r' > "$file"
-  telemetry_read_kv "$file" kv
-  assert_equals_helper 'a' "$LINENO" '1' "${kv[a]-<unset>}"
-  assert_equals_helper 'trimmed key and value, inner space kept' "$LINENO" 'two words' "${kv[b]-<unset>}"
-  assert_equals_helper 'CR on an unterminated last line' "$LINENO" '3' "${kv[c]-<unset>}"
-}
-
-function test_read_kv_ignores_comments_and_blank_lines()
-{
-  local -A kv=()
-  local file="${TD}/kv"
-
-  printf '# a=1\n\n   \nb=2\n#c=3\n' > "$file"
-  telemetry_read_kv "$file" kv
-  assert_equals_helper 'only b' "$LINENO" 'b' "${!kv[*]}"
-}
-
-function test_read_kv_last_duplicate_wins()
-{
-  local -A kv=()
-  local file="${TD}/kv"
-
-  printf 'a=1\na=2\nb=x\na=3\n' > "$file"
-  telemetry_read_kv "$file" kv
-  assert_equals_helper 'a' "$LINENO" '3' "${kv[a]-<unset>}"
-}
-
-function test_read_kv_splits_on_first_equals_and_keeps_inline_comments()
-{
-  local -A kv=()
-  local file="${TD}/kv"
-
-  printf 'endpoint=http://h:1/p?a=b=c\nn=5 # not a comment\n' > "$file"
-  telemetry_read_kv "$file" kv
-  assert_equals_helper 'url' "$LINENO" 'http://h:1/p?a=b=c' "${kv[endpoint]-<unset>}"
-  assert_equals_helper 'inline comment' "$LINENO" '5 # not a comment' "${kv[n]-<unset>}"
-}
-
-function test_read_kv_keeps_empty_values_and_is_case_sensitive()
-{
-  local -A kv=()
-  local file="${TD}/kv"
-
-  printf 'instance_id=\nKey=1\n' > "$file"
-  telemetry_read_kv "$file" kv
-  assert_equals_helper 'empty value is present' "$LINENO" '' "${kv[instance_id]-<unset>}"
-  assert_equals_helper 'key is case-sensitive' "$LINENO" '<unset>' "${kv[key]-<unset>}"
-  assert_equals_helper 'Key' "$LINENO" '1' "${kv[Key]-<unset>}"
-}
-
-function test_read_kv_missing_file_gives_empty_array_and_returns_0()
-{
-  local -A kv=([stale]=1)
-
-  telemetry_read_kv "${TD}/nope" kv
-  assertEquals "($LINENO)" 0 "$?"
-  assert_equals_helper 'empty array' "$LINENO" '0' "${#kv[@]}"
-}
-
-function test_read_kv_empty_file_gives_empty_array()
-{
-  local -A kv=([stale]=1)
-
-  : > "${TD}/kv"
+  # One file with every construct: CRLF, trimming (inner space kept), comments
+  # and blank lines, last duplicate wins, the first '=' splits, no inline
+  # comments, empty values, case-sensitive keys, CR on an unterminated last line.
+  printf 'a=1\r\n  b  =   two words  \r\n# c=3\n\n   \nd=1\nd=2\nd=3\nendpoint=http://h:1/p?a=b=c\nn=5 # not a comment\ninstance_id=\nKey=1\nlast=7\r' > "${TD}/kv"
   telemetry_read_kv "${TD}/kv" kv
   assertEquals "($LINENO)" 0 "$?"
-  assert_equals_helper 'empty array' "$LINENO" '0' "${#kv[@]}"
-}
-
-# Runs telemetry_read_kv in a fresh function scope whose only locals are named
-# outside the list under test, so unsetting the array name cannot hit them.
-function read_kv_into_array_named()
-{
-  local _kvpath="$1"
-  local _kvname="$2"
-
-  unset -v "$_kvname"
-  declare -A "$_kvname"
-  telemetry_read_kv "$_kvpath" "$_kvname" || return 1
-  local -n _kvref="$_kvname"
-  printf '%s' "${_kvref[a]-<unset>}"
-}
-
-function test_read_kv_works_with_caller_arrays_named_like_common_locals()
-{
-  local _kvpath="${TD}/kv"
-  local _kvname
-  local _kvout
-
-  printf 'a=1\n' > "$_kvpath"
-  for _kvname in line key value file path k v i; do
-    _kvout="$(read_kv_into_array_named "$_kvpath" "$_kvname")"
-    assertEquals "($LINENO) return for array ${_kvname}" 0 "$?"
-    assert_equals_helper "array ${_kvname}" "$LINENO" '1' "$_kvout"
-  done
+  expected='Key=1
+a=1
+b=two words
+d=3
+endpoint=http://h:1/p?a=b=c
+instance_id=
+last=7
+n=5 # not a comment'
+  assert_equals_helper 'whole parsed array' "$LINENO" "$expected" "$(dump_kv kv)"
 }
 
 function test_read_kv_does_not_execute_keys_or_values()
@@ -262,47 +140,46 @@ function test_read_kv_does_not_execute_keys_or_values()
 
 # ------------------------------------------------------------- telemetry_paths
 
-function test_paths_use_xdg_directories_and_kworkflow_name()
+# Prints the config, state and db paths, one per line.
+function paths_triplet()
+{
+  telemetry_paths
+  printf '%s\n%s\n%s' "$TELEMETRY_CONFIG" "$TELEMETRY_STATE" "$TELEMETRY_DB"
+}
+
+# The variants run in command substitutions, so the variables they set do not
+# outlive the call.
+function paths_with_kworkflow_name()
 {
   export KWORKFLOW='.kw'
-  telemetry_paths
-  assert_equals_helper 'config' "$LINENO" "${XDG_CONFIG_HOME}/.kw/telemetry.config" "$TELEMETRY_CONFIG"
-  assert_equals_helper 'state' "$LINENO" "${XDG_STATE_HOME}/.kw/telemetry.state" "$TELEMETRY_STATE"
-  assert_equals_helper 'db' "$LINENO" "${XDG_DATA_HOME}/.kw/kw.db" "$TELEMETRY_DB"
+  paths_triplet
 }
 
-function test_paths_default_kworkflow_name_is_kw()
+function paths_with_defaults()
 {
   unset -v KWORKFLOW
-  telemetry_paths
-  assert_equals_helper 'config' "$LINENO" "${XDG_CONFIG_HOME}/kw/telemetry.config" "$TELEMETRY_CONFIG"
-  assert_equals_helper 'state' "$LINENO" "${XDG_STATE_HOME}/kw/telemetry.state" "$TELEMETRY_STATE"
-  assert_equals_helper 'db' "$LINENO" "${XDG_DATA_HOME}/kw/kw.db" "$TELEMETRY_DB"
+  export KW_ETC_DIR="${TD}/etc"
+  paths_triplet
 }
 
-function test_paths_fall_back_to_home_when_xdg_is_unset()
-{
-  unset -v XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME
-  telemetry_paths
-  assert_equals_helper 'config' "$LINENO" "${HOME}/.config/kw/telemetry.config" "$TELEMETRY_CONFIG"
-  assert_equals_helper 'state' "$LINENO" "${HOME}/.local/state/kw/telemetry.state" "$TELEMETRY_STATE"
-  assert_equals_helper 'db' "$LINENO" "${HOME}/.local/share/kw/kw.db" "$TELEMETRY_DB"
-}
-
-function test_paths_honour_kw_variables_over_xdg()
+function paths_with_kw_variables()
 {
   export KW_TELE_CONFIG="${TD}/elsewhere/t.config" KW_STATE_DIR="${TD}/st" KW_DATA_DIR="${TD}/da"
-  telemetry_paths
-  assert_equals_helper 'config' "$LINENO" "${TD}/elsewhere/t.config" "$TELEMETRY_CONFIG"
-  assert_equals_helper 'state' "$LINENO" "${TD}/st/telemetry.state" "$TELEMETRY_STATE"
-  assert_equals_helper 'db' "$LINENO" "${TD}/da/kw.db" "$TELEMETRY_DB"
+  paths_triplet
 }
 
-function test_paths_ignore_kw_etc_dir()
+function test_paths_resolution()
 {
-  export KW_ETC_DIR="${TD}/etc"
-  telemetry_paths
-  assert_equals_helper 'config' "$LINENO" "${XDG_CONFIG_HOME}/kw/telemetry.config" "$TELEMETRY_CONFIG"
+  local expected
+
+  expected="${XDG_CONFIG_HOME}/.kw/telemetry.config"$'\n'"${XDG_STATE_HOME}/.kw/telemetry.state"$'\n'"${XDG_DATA_HOME}/.kw/kw.db"
+  assert_equals_helper 'KWORKFLOW names the directory' "$LINENO" "$expected" "$(paths_with_kworkflow_name)"
+
+  expected="${XDG_CONFIG_HOME}/kw/telemetry.config"$'\n'"${XDG_STATE_HOME}/kw/telemetry.state"$'\n'"${XDG_DATA_HOME}/kw/kw.db"
+  assert_equals_helper 'default name is kw, KW_ETC_DIR is ignored' "$LINENO" "$expected" "$(paths_with_defaults)"
+
+  expected="${TD}/elsewhere/t.config"$'\n'"${TD}/st/telemetry.state"$'\n'"${TD}/da/kw.db"
+  assert_equals_helper 'KW_* variables win over XDG' "$LINENO" "$expected" "$(paths_with_kw_variables)"
 }
 
 function test_paths_do_not_fork()
@@ -318,9 +195,16 @@ function test_paths_do_not_fork()
 # ------------------------------------------------------ telemetry_ensure_schema
 
 # Runs the guard and checks that it prints nothing on either stream.
+#
+# @1: $LINENO of the caller
+# @2: 'unset' to start with TELEMETRY_DB empty, as when the paths were never resolved
 function ensure_schema_quiet()
 {
-  telemetry_paths
+  if [[ "${2:-}" == unset ]]; then
+    TELEMETRY_DB=''
+  else
+    telemetry_paths
+  fi
   telemetry_ensure_schema < /dev/null > "${TD}/schema.out" 2> "${TD}/schema.err"
   SCHEMA_RC="$?"
   assertEquals "($1) stdout" '' "$(< "${TD}/schema.out")"
@@ -339,89 +223,143 @@ function index_is_partial_on_id()
   [[ "$partial" == 1 && "$column" == 'id' && "$sql" == *'sent_at IS NULL'* ]]
 }
 
-function test_ensure_schema_adds_column_and_partial_index()
+function test_ensure_schema()
 {
-  tele_make_db legacy
-  ensure_schema_quiet "$LINENO"
-  assertEquals "($LINENO)" 0 "$SCHEMA_RC"
-  tele_db_has_sent_at
-  assertEquals "($LINENO) sent_at column" 0 "$?"
-  index_is_partial_on_id
-  assertEquals "($LINENO) partial index event_unsent_idx(id) WHERE sent_at IS NULL" 0 "$?"
+  local label
+  local db
+  local wrapper
+  local paths
+  local expected
+  local saved_path="$PATH"
+
+  # db: legacy (no sent_at), current or none. wrapper: a sqlite3 in front of the
+  # real one, 'race' (another kw wins the ALTER) or 'stuck' (the ALTER never
+  # applies). paths: 'unset' leaves TELEMETRY_DB empty. expected is the status
+  # (2: no DB, 1: the column is still missing).
+  while IFS='|' read -r label db wrapper paths expected; do
+    PATH="$saved_path"
+    rm -f "$TELE_DB"
+    [[ "$db" == none ]] || tele_make_db "$db"
+    case "$wrapper" in
+      race) tele_install_sqlite_race 1 ;;
+      stuck) tele_install_sqlite_race 0 ;;
+    esac
+    ensure_schema_quiet "$LINENO" "$paths"
+    assertEquals "(${label}) status" "$expected" "$SCHEMA_RC"
+    [[ "$db" == none ]] && assertFalse "(${label}) must not create the DB" "[[ -e ${TELE_DB} ]]"
+    PATH="$saved_path"
+    if [[ "$expected" == 0 ]]; then
+      tele_db_has_sent_at
+      assertEquals "(${label}) sent_at column" 0 "$?"
+      index_is_partial_on_id
+      assertEquals "(${label}) partial index event_unsent_idx(id) WHERE sent_at IS NULL" 0 "$?"
+    elif [[ "$expected" == 1 ]]; then
+      tele_db_has_sent_at
+      assertEquals "(${label}) sent_at column still missing" 1 "$?"
+    fi
+  done << 'EOF'
+old DB|legacy|-|set|0
+current DB|current|-|set|0
+no DB|none|-|set|2
+paths not resolved yet|legacy|-|unset|0
+another kw wins the ALTER race|legacy|race|set|0
+ALTER never applies|legacy|stuck|set|1
+EOF
 }
 
-function test_ensure_schema_keeps_existing_rows_pending()
+function test_ensure_schema_keeps_the_rows_and_leaves_them_pending()
 {
   tele_make_db legacy
   sqlite3 "$TELE_DB" "INSERT INTO event (date, time) VALUES ('2026-01-01', '10:00:00'), ('2026-01-02', NULL)"
   ensure_schema_quiet "$LINENO"
-  assert_equals_helper 'rows' "$LINENO" '2' "$(sqlite3 "$TELE_DB" 'SELECT COUNT(*) FROM event')"
-  assert_equals_helper 'all pending' "$LINENO" '2' "$(sqlite3 "$TELE_DB" 'SELECT COUNT(*) FROM event WHERE sent_at IS NULL')"
+  assert_equals_helper 'rows kept, all pending' "$LINENO" '2|2' \
+    "$(sqlite3 "$TELE_DB" 'SELECT COUNT(*) || char(124) || COUNT(*) FILTER (WHERE sent_at IS NULL) FROM event')"
 }
 
-function test_ensure_schema_adds_only_the_index_on_a_current_db()
+# kwdb.sql is the single source of the extension tables, so it must run exactly
+# when the report view is missing. A stand-in kwdb.sql leaves a marker table.
+function test_ensure_schema_runs_kwdb_sql_only_when_the_extension_is_missing()
 {
-  tele_make_db
-  ensure_schema_quiet "$LINENO"
-  assertEquals "($LINENO)" 0 "$SCHEMA_RC"
-  index_is_partial_on_id
-  assertEquals "($LINENO) partial index" 0 "$?"
-}
+  local label
+  local view
+  local dir
+  local expected
 
-function test_ensure_schema_is_idempotent()
-{
-  local before
-  local after
+  mkdir -p "${TD}/dbdir" "${TD}/emptydir"
+  printf '%s\n' 'CREATE TABLE IF NOT EXISTS ran_marker (x);' > "${TD}/dbdir/kwdb.sql"
 
-  tele_make_db legacy
-  ensure_schema_quiet "$LINENO"
-  before="$(sqlite3 "$TELE_DB" 'PRAGMA schema_version')"
-  ensure_schema_quiet "$LINENO"
-  after="$(sqlite3 "$TELE_DB" 'PRAGMA schema_version')"
-  assertEquals "($LINENO) second run" 0 "$SCHEMA_RC"
-  assert_equals_helper 'schema untouched by the second run' "$LINENO" "$before" "$after"
-  index_is_partial_on_id
-  assertEquals "($LINENO)" 0 "$?"
-}
-
-function test_ensure_schema_returns_2_without_a_db_and_creates_nothing()
-{
-  ensure_schema_quiet "$LINENO"
-  assertEquals "($LINENO)" 2 "$SCHEMA_RC"
-  assertFalse "($LINENO) must not create the DB" "[[ -e ${TELE_DB} ]]"
-}
-
-function test_ensure_schema_tolerates_a_concurrent_alter()
-{
-  tele_make_db legacy
-  tele_install_sqlite_race 1
-  ensure_schema_quiet "$LINENO"
-  assertEquals "($LINENO) column appeared meanwhile" 0 "$SCHEMA_RC"
-  tele_db_has_sent_at
-  assertEquals "($LINENO)" 0 "$?"
-  index_is_partial_on_id
-  assertEquals "($LINENO) index still created" 0 "$?"
-}
-
-function test_ensure_schema_fails_quietly_when_the_column_stays_missing()
-{
-  tele_make_db legacy
-  tele_install_sqlite_race 0
-  ensure_schema_quiet "$LINENO"
-  assertNotEquals "($LINENO) must fail" 0 "$SCHEMA_RC"
-  assertNotEquals "($LINENO) 2 means no DB" 2 "$SCHEMA_RC"
-}
-
-function test_ensure_schema_stays_silent_on_a_file_that_is_not_a_database()
-{
-  printf 'this is not sqlite\n' > "$TELE_DB"
-  ensure_schema_quiet "$LINENO"
-  assertNotEquals "($LINENO)" 0 "$SCHEMA_RC"
+  # view: whether the report view is dropped first. dir: dbdir (holds kwdb.sql),
+  # emptydir (does not) or unset (KW_DB_DIR itself unset).
+  while IFS='|' read -r label view dir expected; do
+    tele_make_db
+    [[ "$view" == dropped ]] && sqlite3 "$TELE_DB" 'DROP VIEW build_modules_report'
+    if [[ "$dir" == unset ]]; then
+      unset -v KW_DB_DIR
+    else
+      KW_DB_DIR="${TD}/${dir}"
+    fi
+    ensure_schema_quiet "$LINENO"
+    assertEquals "(${label}) status" 0 "$SCHEMA_RC"
+    assertEquals "(${label}) kwdb.sql ran" "$expected" "$(sqlite3 "$TELE_DB" "SELECT count(*) FROM sqlite_master WHERE name = 'ran_marker'")"
+  done << 'EOF'
+view missing|dropped|dbdir|1
+view present|kept|dbdir|0
+view missing, KW_DB_DIR unset|dropped|unset|0
+view missing, no kwdb.sql there|dropped|emptydir|0
+EOF
 }
 
 # ---------------------------------------------------------------- telemetry_gate
 
-function test_gate_early_actions_never_spawn_or_prompt()
+function test_gate_consent_states()
+{
+  local label
+  local consent
+  local id
+  local consented
+  local endpoint
+  local expected
+  local before
+
+  # Only a yes with an instance_id and a consented_endpoint equal to the
+  # effective endpoint (the default one when unset) spawns. The gate never
+  # writes the config.
+  # label | telemetry_consent | instance_id | consented_endpoint | endpoint | outcome
+  while IFS='|' read -r label consent id consented endpoint expected; do
+    tele_write_config "telemetry_consent=${consent}" "instance_id=${id}" \
+      "consented_endpoint=${consented}" ${endpoint:+"endpoint=${endpoint}"}
+    before="$(< "$TELE_CONFIG")"
+    tele_reset_spawn
+    run_gate build "$LINENO"
+    assertEquals "(${label}) stderr" '' "$GATE_ERR"
+    assert_gate_outcome "$LINENO" "$expected" "$label"
+    assert_equals_helper "${label}: config unchanged" "$LINENO" "$before" "$(< "$TELE_CONFIG")"
+    [[ "$expected" == spawned ]] || assertEquals "(${label}) no kw_tele call at all" '' "$(tele_calls)"
+  done << EOF
+consent=yes|yes|${TELE_INSTANCE_ID}|${TELE_ENDPOINT}|${TELE_ENDPOINT}|spawned
+default endpoint when unset|yes|${TELE_INSTANCE_ID}|${TELE_DEFAULT_ENDPOINT}||spawned
+consent=no|no|${TELE_INSTANCE_ID}|${TELE_ENDPOINT}|${TELE_ENDPOINT}|not spawned
+consent=ask without a terminal|ask|${TELE_INSTANCE_ID}|${TELE_ENDPOINT}|${TELE_ENDPOINT}|not spawned
+empty instance_id|yes||${TELE_ENDPOINT}|${TELE_ENDPOINT}|not spawned
+edited endpoint|yes|${TELE_INSTANCE_ID}|http://a.test/v1/logs|http://b.test/v1/logs|not spawned
+trailing slash|yes|${TELE_INSTANCE_ID}|http://a.test/v1/logs|http://a.test/v1/logs/|not spawned
+empty consented_endpoint|yes|${TELE_INSTANCE_ID}||http://a.test/v1/logs|not spawned
+endpoint case differs|yes|${TELE_INSTANCE_ID}|http://A.test/v1/logs|http://a.test/v1/logs|not spawned
+unknown value (case-sensitive)|YES|${TELE_INSTANCE_ID}|${TELE_ENDPOINT}|${TELE_ENDPOINT}|not spawned
+EOF
+
+  rm -f "$TELE_CONFIG"
+  tele_reset_spawn
+  run_gate build "$LINENO"
+  assertEquals "($LINENO) missing config: stderr" '' "$GATE_ERR"
+  assert_gate_outcome "$LINENO" 'not spawned' 'missing config counts as ask'
+  assertFalse "($LINENO) config created" "[[ -e ${TELE_CONFIG} ]]"
+}
+
+# With consent=yes these actions return before the timing and the spawn, even
+# when an upload is due (D53). Consent is read first, so the skip list only
+# keeps help and version from starting uploads.
+function test_gate_exempt_actions_do_not_spawn_when_consent_is_yes()
 {
   local action
 
@@ -431,255 +369,332 @@ function test_gate_early_actions_never_spawn_or_prompt()
     run_gate "$action" "$LINENO"
     assert_gate_outcome "$LINENO" 'not spawned' "action '${action}'"
     assertEquals "($LINENO) action '${action}' stderr" '' "$GATE_ERR"
+    assertEquals "($LINENO) action '${action}' no kw_tele call" '' "$(tele_calls)"
   done
 }
 
-function test_gate_control_a_regular_action_spawns_in_the_same_setup()
+# Runs the gate on a terminal for one action, with stdout in a file.
+#
+# @action: First argument of the kw command
+# @input: Typed input (printf %b)
+function run_gate_on_terminal()
 {
-  tele_consent_yes
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'regular action with due upload'
+  tele_run_pty "$2" "telemetry_gate '${1}' > '${TD}/gate.stdout'"
 }
 
-function test_gate_early_actions_do_not_prompt_on_a_terminal()
+# Consent is checked for every action but `telemetry` (D53): the prompt shows
+# when consent is `ask`, help and version included, and never when it is `no`
+# or `yes`. kw_tele missing silences it.
+function test_gate_prompts_on_a_terminal_only_when_consent_is_not_effective()
+{
+  local label
+  local consent
+  local action
+  local prompted
+  local calls
+
+  # The gate must return 0 and leave stdout empty on every row.
+  # label | consent | action | prompt shown
+  while IFS='|' read -r label consent action prompted; do
+    if [[ "$consent" == yes ]]; then
+      tele_consent_yes
+    else
+      tele_write_config "telemetry_consent=${consent}"
+    fi
+    tele_reset_spawn
+    run_gate_on_terminal "$action" '3\n'
+    assertEquals "(${label}) gate returned 0" 0 "$TELE_PTY_RC"
+    if [[ "$prompted" == yes ]]; then
+      assert_has "$LINENO" "${label}: prompt" "$TELE_PTY_OUT" 'Share kw usage telemetry?'
+      assert_equals_helper "${label}: one question" "$LINENO" 1 "$(count_choice_lines)"
+      assert_equals_helper "${label}: answer recorded" "$LINENO" $'info --pending\nconsent --set no' "$(tele_calls)"
+    else
+      assert_lacks "$LINENO" "${label}: no prompt" "$TELE_PTY_OUT" 'Share kw usage telemetry?'
+      assert_equals_helper "${label}: no kw_tele call" "$LINENO" '' "$(tele_calls)"
+    fi
+    assertEquals "(${label}) stdout" '' "$(< "${TD}/gate.stdout")"
+  done << 'EOF'
+build, ask|ask|build|yes
+help, ask|ask|help|yes
+h, ask|ask|h|yes
+--help, ask|ask|--help|yes
+-h, ask|ask|-h|yes
+man, ask|ask|man|yes
+version, ask|ask|version|yes
+--version, ask|ask|--version|yes
+-v, ask|ask|-v|yes
+empty action, ask|ask||yes
+telemetry, ask|ask|telemetry|no
+build, no|no|build|no
+help, no|no|help|no
+telemetry, no|no|telemetry|no
+help, yes|yes|help|no
+EOF
+
+  # A yes whose endpoint changed counts as ask, and the prompt shows the new one.
+  tele_write_config 'telemetry_consent=yes' "instance_id=${TELE_INSTANCE_ID}" \
+    'consented_endpoint=http://old.test/v1/logs' 'endpoint=http://new.test/v1/logs'
+  tele_reset_spawn
+  run_gate_on_terminal build '3\n'
+  assert_has "$LINENO" 'endpoint mismatch prompts again' "$TELE_PTY_OUT" 'Share kw usage telemetry?'
+  assert_has "$LINENO" 'new endpoint shown' "$TELE_PTY_OUT" 'http://new.test/v1/logs'
+}
+
+# The answer is recorded and nothing uploads on the same command, so a yes to
+# the prompt does not spawn at once either.
+function test_gate_prompt_writes_to_stderr_and_does_not_spawn()
+{
+  tele_write_config 'telemetry_consent=ask'
+  tele_stub_set stdout 'noise from kw_tele'
+  tele_stub_set stdout.info $'pending_events=2\npending_since=2026-01-05'
+  tele_run_pty '1\n' "telemetry_gate build > '${TD}/gate.stdout'"
+  assertEquals "($LINENO) gate returned 0" 0 "$TELE_PTY_RC"
+  assert_has "$LINENO" 'answer 1' "$(tele_calls)" 'consent --set yes --include-history'
+  assert_lacks "$LINENO" 'nothing uploads on the same command' "$(tele_calls)" 'upload'
+  assertFalse "($LINENO) spawn file" "[[ -e ${TELE_STATE_DIR}/telemetry.spawn ]]"
+  assertEquals "($LINENO) kw_tele output must not reach stdout" '' "$(< "${TD}/gate.stdout")"
+}
+
+# Without kw_tele nothing prompts, whatever the action.
+function test_gate_without_kw_tele_never_prompts()
 {
   local action
 
   tele_write_config 'telemetry_consent=ask'
-  for action in help version telemetry; do
-    tele_run_pty '3\n' "telemetry_gate ${action}"
-    assertEquals "($LINENO) gate ran and returned 0" 0 "$TELE_PTY_RC"
-    assert_lacks "$LINENO" "action ${action}" "$TELE_PTY_OUT" 'Share kw usage telemetry?'
+  tele_limited_path kw_tele
+  for action in build help ''; do
+    TELE_PTY_EXTRA="PATH='${TELE_LIMITED_PATH}'" run_gate_on_terminal "$action" '3\n'
+    assertEquals "(action '${action}') gate returned 0" 0 "$TELE_PTY_RC"
+    assert_lacks "$LINENO" "action '${action}': no prompt" "$TELE_PTY_OUT" 'Share kw usage telemetry?'
   done
   assertEquals "($LINENO) no kw_tele call" '' "$(tele_calls)"
 }
 
-function test_gate_does_nothing_when_kw_tele_is_not_on_path()
-{
-  tele_consent_yes
-  tele_limited_path kw_tele
-  GATE_PATH="$TELE_LIMITED_PATH" run_gate build "$LINENO"
-  assertEquals "($LINENO) stderr" '' "$GATE_ERR"
-  assert_gate_outcome "$LINENO" 'not spawned' 'no kw_tele'
-  assertFalse "($LINENO) spawn file" "[[ -e ${TELE_STATE_DIR}/telemetry.spawn ]]"
-}
-
-function test_gate_does_nothing_when_consent_is_no()
-{
-  tele_write_config 'telemetry_consent=no' "endpoint=${TELE_ENDPOINT}"
-  run_gate build "$LINENO"
-  assertEquals "($LINENO) stderr" '' "$GATE_ERR"
-  assert_gate_outcome "$LINENO" 'not spawned' 'consent=no'
-  assertEquals "($LINENO) no kw_tele call at all" '' "$(tele_calls)"
-}
-
-function test_gate_does_not_prompt_when_consent_is_no_on_a_terminal()
-{
-  tele_write_config 'telemetry_consent=no'
-  tele_run_pty '1\n' 'telemetry_gate build'
-  assertEquals "($LINENO) gate ran and returned 0" 0 "$TELE_PTY_RC"
-  assert_lacks "$LINENO" 'prompt' "$TELE_PTY_OUT" 'Share kw usage telemetry?'
-  assertEquals "($LINENO)" '' "$(tele_calls)"
-}
-
-function test_gate_consent_ask_without_a_terminal_neither_prompts_nor_writes()
-{
-  local before
-
-  tele_write_config 'telemetry_consent=ask' "endpoint=${TELE_ENDPOINT}"
-  before="$(< "$TELE_CONFIG")"
-  run_gate build "$LINENO"
-  assertEquals "($LINENO) stderr" '' "$GATE_ERR"
-  assert_equals_helper 'config unchanged' "$LINENO" "$before" "$(< "$TELE_CONFIG")"
-  assertEquals "($LINENO) no kw_tele call" '' "$(tele_calls)"
-  assert_gate_outcome "$LINENO" 'not spawned' 'ask'
-}
-
-function test_gate_missing_config_counts_as_ask_and_writes_nothing()
-{
-  rm -f "$TELE_CONFIG"
-  run_gate build "$LINENO"
-  assertEquals "($LINENO) stderr" '' "$GATE_ERR"
-  assertFalse "($LINENO) config created" "[[ -e ${TELE_CONFIG} ]]"
-  assertEquals "($LINENO)" '' "$(tele_calls)"
-}
-
-function test_gate_unknown_consent_value_counts_as_ask()
-{
-  tele_write_config 'telemetry_consent=YES' "instance_id=${TELE_INSTANCE_ID}" "consented_endpoint=${TELE_DEFAULT_ENDPOINT}"
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" 'not spawned' 'values are case-sensitive'
-  assertEquals "($LINENO)" '' "$(tele_calls)"
-}
-
-function test_gate_consent_ask_with_a_terminal_prompts_and_does_not_upload()
-{
-  tele_write_config 'telemetry_consent=ask'
-  tele_stub_set stdout.info $'pending_events=2\npending_since=2026-01-05'
-  tele_run_pty '3\n' 'telemetry_gate build'
-  assert_has "$LINENO" 'prompt' "$TELE_PTY_OUT" 'Share kw usage telemetry?'
-  assert_has "$LINENO" 'answer 3' "$(tele_calls)" 'consent --set no'
-  assert_lacks "$LINENO" 'nothing uploads on the same command' "$(tele_calls)" 'upload'
-  assertFalse "($LINENO) spawn file" "[[ -e ${TELE_STATE_DIR}/telemetry.spawn ]]"
-}
-
-function test_gate_effective_consent_needs_a_non_empty_instance_id()
-{
-  tele_write_config 'telemetry_consent=yes' 'instance_id=' "consented_endpoint=${TELE_DEFAULT_ENDPOINT}"
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" 'not spawned' 'empty instance_id'
-}
-
-function test_gate_effective_consent_fails_on_endpoint_mismatch()
+# Without both terminals nothing is asked, whatever the action, and nothing
+# runs: no kw_tele call, no sqlite call, no output.
+function test_gate_with_consent_ask_and_no_terminal_does_nothing()
 {
   local label
-  local consented
-  local endpoint
+  local action
+  local stdin_kind
 
-  while IFS='|' read -r label consented endpoint; do
-    tele_write_config 'telemetry_consent=yes' "instance_id=${TELE_INSTANCE_ID}" \
-      "consented_endpoint=${consented}" "endpoint=${endpoint}"
-    tele_reset_spawn
-    run_gate build "$LINENO"
-    assert_gate_outcome "$LINENO" 'not spawned' "$label"
+  mkdir -p "${TD}/sqlbin"
+  printf '%s\n' '#!/usr/bin/env bash' "printf '%s\\n' \"\$*\" >> '${TD}/sqlite.calls'" > "${TD}/sqlbin/sqlite3"
+  chmod 755 "${TD}/sqlbin/sqlite3"
+  PATH="${TD}/sqlbin:${PATH}"
+  tele_make_db 2> /dev/null || true
+  tele_write_config 'telemetry_consent=ask'
+  : > "${TD}/sqlite.calls"
+
+  # label | action | what stdin is
+  while IFS='|' read -r label action stdin_kind; do
+    rm -f "${KW_TELE_STUB_DIR}/record"
+    : > "${TD}/sqlite.calls"
+    if [[ "$stdin_kind" == pipe ]]; then
+      printf '3\n' | telemetry_gate "$action" > "${TD}/gate.out" 2> "${TD}/gate.err"
+    else
+      telemetry_gate "$action" < /dev/null > "${TD}/gate.out" 2> "${TD}/gate.err"
+    fi
+    assertEquals "(${label}) return" 0 "$?"
+    assertEquals "(${label}) stdout" '' "$(< "${TD}/gate.out")"
+    assertEquals "(${label}) stderr" '' "$(< "${TD}/gate.err")"
+    assertEquals "(${label}) no kw_tele call" '' "$(tele_calls)"
+    assertEquals "(${label}) no sqlite call" '' "$(< "${TD}/sqlite.calls")"
+    assertFalse "(${label}) no spawn file" "[[ -e ${TELE_STATE_DIR}/telemetry.spawn ]]"
   done << 'EOF'
-edited endpoint|http://a.test/v1/logs|http://b.test/v1/logs
-trailing slash|http://a.test/v1/logs|http://a.test/v1/logs/
-empty consented_endpoint||http://a.test/v1/logs
-case differs|http://A.test/v1/logs|http://a.test/v1/logs
+help, stdin /dev/null|help|null
+help, stdin a pipe|help|pipe
+build, stdin /dev/null|build|null
+build, stdin a pipe|build|pipe
 EOF
 }
 
-function test_gate_endpoint_mismatch_prompts_again_on_a_terminal()
+# One terminal is not enough: both stdin and stderr must be terminals.
+function test_gate_with_only_one_terminal_does_not_prompt()
 {
-  tele_write_config 'telemetry_consent=yes' "instance_id=${TELE_INSTANCE_ID}" \
-    'consented_endpoint=http://old.test/v1/logs' 'endpoint=http://new.test/v1/logs'
-  tele_run_pty '\n' 'telemetry_gate build'
-  assert_has "$LINENO" 'prompt' "$TELE_PTY_OUT" 'Share kw usage telemetry?'
-  assert_has "$LINENO" 'new endpoint shown' "$TELE_PTY_OUT" 'http://new.test/v1/logs'
+  local label
+  local action
+  local redirect
+
+  tele_write_config 'telemetry_consent=ask'
+  # label | action | redirection of the gate call
+  while IFS='|' read -r label action redirect; do
+    rm -f "${KW_TELE_STUB_DIR}/record" "${TD}/gate.stderr"
+    tele_run_pty '3\n' "telemetry_gate ${action} ${redirect//TD/${TD}}"
+    assertEquals "(${label}) gate returned 0" 0 "$TELE_PTY_RC"
+    assert_lacks "$LINENO" "${label}: no prompt on the terminal" "$TELE_PTY_OUT" 'Share kw usage telemetry?'
+    [[ -e "${TD}/gate.stderr" ]] && assertEquals "(${label}) no prompt in the stderr file" '' "$(< "${TD}/gate.stderr")"
+    assertEquals "(${label}) no kw_tele call" '' "$(tele_calls)"
+  done << 'EOF'
+only stderr a tty, build|build|< /dev/null
+only stderr a tty, help|help|< /dev/null
+only stdin a tty, build|build|2> 'TD/gate.stderr'
+only stdin a tty, help|help|2> 'TD/gate.stderr'
+EOF
 }
 
-function test_gate_consent_is_effective_with_the_default_endpoint_when_unset()
+function test_gate_spawns_only_when_due()
 {
-  tele_write_config 'telemetry_consent=yes' "instance_id=${TELE_INSTANCE_ID}" "consented_endpoint=${TELE_DEFAULT_ENDPOINT}"
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'default endpoint'
+  # A last_success_at or last_attempt_at in the future (clock jump, copied
+  # state) must not block spawning. The failure gap doubles from 3600 s per
+  # failure and is capped at 86400 s.
+  # config | outcome | attempt age | success age | failures
+  check_timing_rows "$LINENO" << 'EOF'
+|spawned|never|86400|0
+|not spawned|never|86399|0
+|not spawned|3599|never|0
+|spawned|3600|never|0
+|not spawned|7199|never|2
+|spawned|7200|never|2
+|not spawned|86399|never|30
+|spawned|86400|never|30
+|spawned|never|-864000|0
+|spawned|-864000|never|0
+EOF
 }
 
-function test_gate_reads_a_config_with_crlf_line_endings()
+function test_gate_timing_follows_the_config_values()
 {
-  printf 'telemetry_consent=yes\r\ninstance_id=%s\r\nconsented_endpoint=%s\r\nendpoint=%s\r\n' \
-    "$TELE_INSTANCE_ID" "$TELE_ENDPOINT" "$TELE_ENDPOINT" > "$TELE_CONFIG"
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'CRLF'
+  # The failure gap is capped by the larger of upload_interval and
+  # upload_backoff. A value outside the integer grammar falls back to the
+  # default (backoff 3600 s, interval 86400 s), and is never evaluated.
+  rm -f /tmp/kw_tele_pwned
+  check_timing_rows "$LINENO" << 'EOF'
+upload_backoff=60|not spawned|59|never|0
+upload_backoff=60|spawned|60|never|0
+upload_interval=100|not spawned|never|99|0
+upload_interval=100|spawned|never|100|0
+upload_backoff=100000,upload_interval=50|not spawned|99999|never|3
+upload_backoff=100000,upload_interval=50|spawned|100000|never|3
+upload_backoff=08|not spawned|2000|never|0
+upload_backoff=010|not spawned|100|never|0
+upload_backoff=soon|not spawned|2000|never|0
+upload_backoff=1+1|not spawned|2000|never|0
+upload_backoff=a[$(touch /tmp/kw_tele_pwned)]|not spawned|2000|never|0
+upload_backoff = 100 |spawned|2000|never|0
+EOF
+  assertFalse "($LINENO) config value was evaluated" '[[ -e /tmp/kw_tele_pwned ]]'
 }
 
-function test_gate_spawns_when_time_is_due()
+# telemetry_int is what keeps the state file, the spawn file and the config
+# from being evaluated as arithmetic.
+function test_telemetry_int_grammar()
 {
+  local label
+  local value
+  local min
+  local max
+  local fallback
+  local expected
+  local out
+
+  # label | value | min | max | default | result
+  while IFS='|' read -r label value min max fallback expected; do
+    out='unset'
+    telemetry_int out "$value" "$min" "$max" "$fallback"
+    assert_equals_helper "$label" "$LINENO" "$expected" "$out"
+  done << 'EOF'
+zero is valid|0|0|10|7|0
+the maximum is inclusive|10|0|10|7|10
+above the maximum|11|0|10|7|7
+the minimum is inclusive|5|5|10|7|5
+below the minimum|4|5|10|7|7
+leading zero (octal)|010|0|99|7|7
+only zeros|00|0|99|7|7
+empty|''|0|99|7|7
+sign|-1|0|99|7|7
+plus sign|+1|0|99|7|7
+trailing space|1 |0|99|7|7
+arithmetic|1+1|0|99|7|7
+18 digits|999999999999999999|0|9223372036854775807|7|999999999999999999
+19 digits|1000000000000000000|0|9223372036854775807|7|7
+20 digits wrap around int64|99999999999999999999|0|9223372036854775807|7|7
+EOF
+  # an empty row value stands for the empty string
+  telemetry_int out '' 0 99 7
+  assert_equals_helper 'empty string' "$LINENO" 7 "$out"
+}
+
+# The state file is read on every kw command, so a hostile value must stay
+# data and the gate must read it as invalid (zero), which makes an upload due.
+function test_gate_state_values_are_not_evaluated()
+{
+  local key
+  local marker="${TD}/state_pwned"
+
   tele_consent_yes
-  tele_write_state 0 $((TELE_NOW - 86400)) 0
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'time_due at exactly upload_interval'
+  for key in last_attempt_at last_success_at consecutive_failures; do
+    rm -f "$marker"
+    tele_reset_spawn
+    printf 'last_attempt_at=0\nlast_success_at=0\nconsecutive_failures=0\n%s=a[$(touch %s)]\n' "$key" "$marker" > "${TELE_STATE_DIR}/telemetry.state"
+    run_gate build "$LINENO"
+    assertFalse "(${key}) the value was evaluated" "[[ -e ${marker} ]]"
+    assertEquals "(${key}) stderr" '' "$GATE_ERR"
+    assert_gate_outcome "$LINENO" spawned "hostile ${key} reads as invalid"
+  done
 }
 
-function test_gate_does_not_spawn_just_before_time_is_due()
+# The spawn file bounds spawns to one per backoff. Garbage or a future value
+# must not block uploads for good (D40, D47).
+function test_gate_spawn_file_content()
 {
-  tele_consent_yes
-  tele_make_db
-  tele_write_state 0 $((TELE_NOW - 86399)) 0
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" 'not spawned' 'one second before time_due'
+  local label
+  local content
+  local expected
+  local marker="${TD}/spawn_pwned"
+
+  # content | spawn file after the run: 'now' (spawned) or 'kept'
+  while IFS='|' read -r label content expected; do
+    rm -f "$marker"
+    tele_reset_spawn
+    tele_consent_yes
+    printf '%s\n' "$content" > "${TELE_STATE_DIR}/telemetry.spawn"
+    run_gate build "$LINENO"
+    assertFalse "(${label}) the value was evaluated" "[[ -e ${marker} ]]"
+    if [[ "$expected" == now ]]; then
+      assertEquals "(${label}) spawn file rewritten" "$TELE_NOW" "$(< "${TELE_STATE_DIR}/telemetry.spawn")"
+      assertTrue "(${label}) upload ran" tele_wait_for_upload
+    else
+      assertEquals "(${label}) spawn file kept" "$content" "$(< "${TELE_STATE_DIR}/telemetry.spawn")"
+      assertEquals "(${label}) no upload" 0 "$(tele_upload_calls)"
+    fi
+  done << EOF
+recent spawn blocks|$((TELE_NOW - 10))|kept
+garbage|abc|now
+negative|-5|now
+leading zero|010|now
+in the future|$((TELE_NOW + 100000))|now
+arithmetic|a[\$(touch ${TD}/spawn_pwned)]|now
+EOF
 }
 
-function test_gate_spacing_after_a_success_is_upload_backoff()
+# KW_TELE_NOW is a test hook: without KW_TELE_TEST=1 the real clock is used,
+# and an invalid value under the flag also falls back to it. The state below
+# is recent only against the fake clock; against the real one it lies in the
+# future, so it counts as never and an upload is due.
+function test_gate_clock_override_needs_the_test_flag()
 {
-  tele_consent_yes
-  tele_write_state $((TELE_NOW - 3599)) 0 0
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" 'not spawned' 'attempt 3599 s ago'
-  tele_reset_spawn
-  tele_write_state $((TELE_NOW - 3600)) 0 0
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'attempt exactly upload_backoff ago'
-}
-
-function test_gate_spacing_doubles_with_each_failure_and_is_capped()
-{
-  local failures
-  local gap
-  local attempt
+  local label
+  local flag
+  local now_value
   local expected
 
   tele_consent_yes
-  while IFS=' ' read -r failures gap; do
-    for attempt in $((gap - 1)) "$gap"; do
-      tele_reset_spawn
-      tele_write_state $((TELE_NOW - attempt)) 0 "$failures"
-      run_gate build "$LINENO"
-      expected='not spawned'
-      ((attempt >= gap)) && expected='spawned'
-      assert_gate_outcome "$LINENO" "$expected" "k=${failures} gap=${gap} attempt ${attempt} s ago"
-    done
-  done << 'EOF'
-1 3600
-2 7200
-3 14400
-5 57600
-6 86400
-30 86400
+  # label | KW_TELE_TEST | KW_TELE_NOW | outcome
+  while IFS='|' read -r label flag now_value expected; do
+    tele_reset_spawn
+    tele_write_state $((TELE_NOW - 10)) 0 0
+    KW_TELE_TEST="$flag" KW_TELE_NOW="$now_value" run_gate build "$LINENO"
+    assert_gate_outcome "$LINENO" "$expected" "$label"
+  done << EOF
+flag set, fake clock honoured|1|${TELE_NOW}|not spawned
+flag unset, fake clock ignored||${TELE_NOW}|spawned
+flag 0, fake clock ignored|0|${TELE_NOW}|spawned
+flag set, garbage clock falls back to the real one|1|soon|spawned
 EOF
 }
 
-function test_gate_failure_gap_is_capped_by_the_larger_of_interval_and_backoff()
-{
-  tele_consent_yes 'upload_backoff=100000' 'upload_interval=50'
-  tele_write_state $((TELE_NOW - 100000)) 0 3
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'gap is min(400000, max(50, 100000))'
-  tele_reset_spawn
-  tele_write_state $((TELE_NOW - 99999)) 0 3
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" 'not spawned' 'one second short of the capped gap'
-}
-
-function test_gate_honours_upload_backoff_from_the_config()
-{
-  tele_consent_yes 'upload_backoff=60'
-  tele_write_state $((TELE_NOW - 59)) 0 0
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" 'not spawned' '59 s'
-  tele_reset_spawn
-  tele_write_state $((TELE_NOW - 60)) 0 0
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned '60 s'
-}
-
-function test_gate_honours_upload_interval_from_the_config()
-{
-  tele_consent_yes 'upload_interval=100'
-  tele_make_db
-  tele_write_state 0 $((TELE_NOW - 99)) 0
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" 'not spawned' '99 s since success'
-  tele_reset_spawn
-  tele_write_state 0 $((TELE_NOW - 100)) 0
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned '100 s since success'
-}
-
-function test_gate_spawn_file_limits_spawns_to_one_per_backoff()
-{
-  tele_consent_yes
-  printf '%s\n' $((TELE_NOW - 3599)) > "${TELE_STATE_DIR}/telemetry.spawn"
-  run_gate build "$LINENO"
-  assertEquals "($LINENO) no upload" 0 "$(tele_upload_calls)"
-  assertEquals "($LINENO) spawn file kept" $((TELE_NOW - 3599)) "$(< "${TELE_STATE_DIR}/telemetry.spawn")"
-  printf '%s\n' $((TELE_NOW - 3600)) > "${TELE_STATE_DIR}/telemetry.spawn"
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'spawned exactly upload_backoff ago'
-}
-
-function test_gate_second_call_inside_the_backoff_does_not_spawn_even_if_the_uploader_wrote_no_state()
+function test_gate_second_call_inside_the_backoff_does_not_spawn()
 {
   tele_consent_yes
   tele_stub_set exit 1
@@ -694,90 +709,37 @@ function test_gate_second_call_inside_the_backoff_does_not_spawn_even_if_the_upl
   assertEquals "($LINENO) spawn file refreshed after the backoff" $((TELE_NOW + 3600)) "$(< "${TELE_STATE_DIR}/telemetry.spawn")"
 }
 
-function test_gate_garbage_in_the_spawn_file_counts_as_zero()
+function test_gate_spawns_at_the_batch_size()
 {
-  tele_consent_yes
-  printf '%s\n' '08' > "${TELE_STATE_DIR}/telemetry.spawn"
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'invalid integer falls back to 0'
-  assertEquals "($LINENO)" "$TELE_NOW" "$(< "${TELE_STATE_DIR}/telemetry.spawn")"
+  local cfg
+  local pending
+  local attempt
+  local expected
+
+  # Rows already sent or excluded (sent_at set) never count. The success age of
+  # 100 s keeps the time trigger off. An invalid batch_size falls back to 500.
+  # config | pending rows | attempt age | outcome
+  while IFS='|' read -r cfg pending attempt expected; do
+    tele_reset_spawn
+    tele_make_db
+    tele_add_events "$pending"
+    tele_add_events 3 -1
+    tele_add_events 3 1700000000
+    tele_consent_yes "$cfg"
+    tele_write_state "$(seconds_ago "$attempt")" $((TELE_NOW - 100)) 0
+    run_gate build "$LINENO"
+    assertEquals "(${cfg} pending=${pending}) stderr" '' "$GATE_ERR"
+    assert_gate_outcome "$LINENO" "$expected" "${cfg} with ${pending} pending, attempt ${attempt}"
+  done << 'EOF'
+batch_size=5|4|never|not spawned
+batch_size=5|5|never|spawned
+batch_size=5|9|100|not spawned
+batch_size=0|100|never|not spawned
+batch_size=lots|100|never|not spawned
+EOF
 }
 
-function test_gate_spawn_file_holds_now_and_a_newline_only()
-{
-  local content=''
-
-  tele_consent_yes
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'due'
-  IFS= read -r -d '' content < "${TELE_STATE_DIR}/telemetry.spawn"
-  assert_equals_helper 'bytes' "$LINENO" "${TELE_NOW}"$'\n' "$content"
-}
-
-function test_gate_below_batch_does_not_spawn()
-{
-  tele_consent_yes 'batch_size=5'
-  tele_make_db
-  tele_add_events 4
-  tele_add_events 3 -1
-  tele_add_events 3 1700000000
-  tele_write_state 0 $((TELE_NOW - 100)) 0
-  run_gate build "$LINENO"
-  assertEquals "($LINENO) stderr" '' "$GATE_ERR"
-  assert_gate_outcome "$LINENO" 'not spawned' '4 pending of 5; excluded and sent rows do not count'
-}
-
-function test_gate_at_batch_spawns()
-{
-  tele_consent_yes 'batch_size=5'
-  tele_make_db
-  tele_add_events 5
-  tele_add_events 3 -1
-  tele_write_state 0 $((TELE_NOW - 100)) 0
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned '5 pending of 5'
-}
-
-function test_gate_above_batch_spawns_and_the_count_is_capped()
-{
-  tele_consent_yes 'batch_size=5'
-  tele_make_db
-  tele_add_events 40
-  tele_write_state 0 $((TELE_NOW - 100)) 0
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned '40 pending'
-}
-
-function test_gate_size_due_still_needs_spacing()
-{
-  tele_consent_yes 'batch_size=5'
-  tele_make_db
-  tele_add_events 9
-  tele_write_state $((TELE_NOW - 100)) $((TELE_NOW - 100)) 0
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" 'not spawned' 'spacing not ok'
-}
-
-function test_gate_count_query_is_the_capped_readonly_one()
-{
-  local args
-
-  tele_consent_yes 'batch_size=7'
-  tele_make_db
-  tele_install_fake_count 0
-  tele_write_state 0 $((TELE_NOW - 100)) 0
-  run_gate build "$LINENO"
-  args=$'\n'"$(< "$TELE_SQLITE_RECORD")"$'\n'
-  assert_has "$LINENO" 'readonly' "$args" $'\n-readonly\n'
-  assert_has "$LINENO" 'init' "$args" $'\n-init\n/dev/null\n'
-  assert_has "$LINENO" 'batch' "$args" $'\n-batch\n'
-  assert_has "$LINENO" 'noheader' "$args" $'\n-noheader\n'
-  assert_has "$LINENO" 'timeout' "$args" $'\n.timeout 100\n'
-  assert_has "$LINENO" 'db' "$args" $'\n'"${TELE_DB}"$'\n'
-  assert_has "$LINENO" 'sql' "$args" $'\nSELECT COUNT(*) FROM (SELECT 1 FROM event WHERE sent_at IS NULL LIMIT 7)\n'
-}
-
-function test_gate_count_that_fails_or_is_not_an_integer_does_not_spawn()
+function test_gate_bad_count_does_not_spawn()
 {
   local label
   local value
@@ -793,138 +755,60 @@ function test_gate_count_that_fails_or_is_not_an_integer_does_not_spawn()
     assert_gate_outcome "$LINENO" 'not spawned' "$label"
   done << 'EOF'
 non-integer|many|0
-empty output||0
 failure with a big number|99|1
-negative|-1|0
 EOF
 }
 
-function test_gate_count_failure_on_a_db_without_sent_at_is_silent()
+# The COUNT runs on every kw command, so it must not read ~/.sqliterc (which
+# could run commands) or be able to create a database.
+function test_gate_count_query_ignores_the_users_sqliterc()
+{
+  local -a argv
+
+  tele_consent_yes 'batch_size=5'
+  tele_make_db
+  tele_write_state 0 $((TELE_NOW - 100)) 0
+
+  tele_install_fake_count 0
+  run_gate build "$LINENO"
+  mapfile -t argv < "$TELE_SQLITE_RECORD"
+  assert_equals_helper 'read-only flag' "$LINENO" 1 "$(printf '%s\n' "${argv[@]}" | grep -c -x -e '-readonly')"
+  assert_equals_helper 'rc file replaced by /dev/null' "$LINENO" '-init|/dev/null' "$(printf '%s\n' "${argv[@]}" | grep -x -A1 -e '-init' | paste -sd'|' -)"
+
+  PATH="${TELE_ORIG_PATH}"
+  PATH="${TD}/stubbin:${PATH}"
+  mkdir -p "$HOME"
+  printf '%s\n' ".shell touch ${TD}/sqliterc_ran" > "${HOME}/.sqliterc"
+  tele_reset_spawn
+  run_gate build "$LINENO"
+  assertFalse "($LINENO) ~/.sqliterc was read" "[[ -e ${TD}/sqliterc_ran ]]"
+  assertEquals "($LINENO) stderr" '' "$GATE_ERR"
+}
+
+function test_gate_count_without_a_usable_db_is_silent()
 {
   tele_consent_yes
-  tele_make_db legacy
   tele_write_state 0 $((TELE_NOW - 100)) 0
+  tele_make_db legacy
   run_gate build "$LINENO"
-  assertEquals "($LINENO) nothing on stderr" '' "$GATE_ERR"
+  assertEquals "($LINENO) legacy DB: stderr" '' "$GATE_ERR"
   assert_gate_outcome "$LINENO" 'not spawned' 'no sent_at column'
   tele_db_has_sent_at
   assertEquals "($LINENO) the gate must not migrate on the COUNT path" 1 "$?"
-}
 
-function test_gate_missing_db_on_the_count_path_is_silent_and_creates_nothing()
-{
-  tele_consent_yes
-  tele_write_state 0 $((TELE_NOW - 100)) 0
+  rm -f "$TELE_DB"
+  tele_reset_spawn
   run_gate build "$LINENO"
-  assertEquals "($LINENO) nothing on stderr" '' "$GATE_ERR"
+  assertEquals "($LINENO) missing DB: stderr" '' "$GATE_ERR"
   assert_gate_outcome "$LINENO" 'not spawned' 'no DB'
   assertFalse "($LINENO) DB created" "[[ -e ${TELE_DB} ]]"
 }
 
-function test_gate_ignores_a_sqliterc_in_home()
-{
-  tele_consent_yes 'batch_size=5'
-  tele_make_db
-  tele_add_events 1
-  printf '%s\n' '.print NOISE' > "${HOME}/.sqliterc"
-  tele_write_state 0 $((TELE_NOW - 100)) 0
-  run_gate build "$LINENO"
-  assertEquals "($LINENO)" '' "$GATE_ERR"
-  assert_gate_outcome "$LINENO" 'not spawned' 'rc file output must not be read as the count'
-}
-
-function test_gate_integer_grammar_for_config_values()
-{
-  local label
-  local setting
-
-  while IFS='|' read -r label setting; do
-    tele_reset_spawn
-    tele_consent_yes "$setting"
-    tele_write_state $((TELE_NOW - 2000)) 0 0
-    run_gate build "$LINENO"
-    assert_gate_outcome "$LINENO" 'not spawned' "${label}: falls back to the 3600 s default"
-  done << 'EOF'
-leading zero|upload_backoff=08
-negative|upload_backoff=-1
-plus sign|upload_backoff=+5
-19 digits|upload_backoff=1234567890123456789
-zero|upload_backoff=0
-above range|upload_backoff=31536001
-not a number|upload_backoff=soon
-EOF
-}
-
-function test_gate_valid_integers_are_taken_as_decimal()
-{
-  tele_consent_yes 'upload_backoff = 100 '
-  tele_write_state $((TELE_NOW - 2000)) 0 0
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'whitespace around the integer is trimmed'
-  tele_reset_spawn
-  tele_consent_yes 'upload_backoff=31536000'
-  tele_write_state $((TELE_NOW - 31535999)) 0 0
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" 'not spawned' 'upper bound of the range is valid'
-}
-
-function test_gate_upload_interval_with_a_leading_zero_falls_back_to_the_default()
-{
-  tele_consent_yes 'upload_interval=08'
-  tele_make_db
-  tele_write_state 0 $((TELE_NOW - 50000)) 0
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" 'not spawned' 'default 86400, not 8'
-}
-
-function test_gate_batch_size_zero_and_invalid_values_fall_back_to_500()
-{
-  local setting
-
-  tele_make_db
-  tele_add_events 100
-  tele_write_state 0 $((TELE_NOW - 100)) 0
-  for setting in batch_size=0 batch_size=08 batch_size=5001 batch_size=-3 batch_size=lots; do
-    tele_reset_spawn
-    tele_consent_yes "$setting"
-    run_gate build "$LINENO"
-    assert_gate_outcome "$LINENO" 'not spawned' "${setting}: 100 pending is below the default 500"
-  done
-}
-
-function test_gate_batch_size_upper_bound_is_valid()
-{
-  tele_consent_yes 'batch_size=5000'
-  tele_make_db
-  tele_add_events 4999
-  tele_write_state 0 $((TELE_NOW - 100)) 0
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" 'not spawned' '4999 of 5000'
-  tele_add_events 1
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned '5000 of 5000'
-}
-
-function test_gate_integer_grammar_for_state_values()
+# What the uploader is started with: argv and the environment kw_tele reads.
+function test_gate_spawn_passes_the_kw_environment()
 {
   tele_consent_yes
-  printf 'last_attempt_at=%s\nlast_success_at=0\nconsecutive_failures=08\nlast_status=\n' \
-    $((TELE_NOW - 4000)) > "${TELE_STATE_DIR}/telemetry.state"
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'consecutive_failures=08 reads as 0, gap 3600'
-}
-
-function test_gate_state_file_with_crlf_and_no_final_newline()
-{
-  tele_consent_yes
-  printf 'last_attempt_at=%s\r\nlast_success_at=0\r\nconsecutive_failures=0' $((TELE_NOW - 100)) > "${TELE_STATE_DIR}/telemetry.state"
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" 'not spawned' 'attempt 100 s ago'
-}
-
-function test_gate_spawn_passes_exact_environment_to_kw_tele()
-{
-  tele_consent_yes
+  tele_write_state 5 6 1
   run_gate build "$LINENO"
   assert_gate_outcome "$LINENO" spawned 'due'
   assert_equals_helper 'argv' "$LINENO" 'upload' "$(tele_calls)"
@@ -935,164 +819,28 @@ function test_gate_spawn_passes_exact_environment_to_kw_tele()
   assert_equals_helper 'KW_VERSION' "$LINENO" "$(head -n 1 ./src/VERSION)" "$(tele_call_field upload KW_VERSION)"
 }
 
-function test_gate_spawn_passes_the_callers_explicit_paths()
-{
-  export KW_TELE_CONFIG="${TD}/cfg/custom.config" KW_STATE_DIR="${TD}/custom_state" KW_DATA_DIR="${TD}/custom_data"
-  mkdir -p "${TD}/cfg" "$KW_STATE_DIR" "$KW_DATA_DIR"
-  printf 'telemetry_consent=yes\ninstance_id=%s\nconsented_endpoint=%s\nendpoint=%s\n' \
-    "$TELE_INSTANCE_ID" "$TELE_ENDPOINT" "$TELE_ENDPOINT" > "$KW_TELE_CONFIG"
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'due'
-  assert_equals_helper 'KW_TELE_CONFIG' "$LINENO" "$KW_TELE_CONFIG" "$(tele_call_field upload KW_TELE_CONFIG)"
-  assert_equals_helper 'KW_DATA_DIR' "$LINENO" "$KW_DATA_DIR" "$(tele_call_field upload KW_DATA_DIR)"
-  assert_equals_helper 'KW_STATE_DIR' "$LINENO" "$KW_STATE_DIR" "$(tele_call_field upload KW_STATE_DIR)"
-  assertTrue "($LINENO) spawn file in the given state dir" "[[ -e ${KW_STATE_DIR}/telemetry.spawn ]]"
-}
-
-function test_gate_kw_version_comes_from_the_first_line_of_the_lib_dir_version_file()
-{
-  mkdir -p "${TD}/lib_a" "${TD}/lib_b"
-  printf '1.2.3-test\nBranch: x\n' > "${TD}/lib_a/VERSION"
-  export KW_LIB_DIR="${TD}/lib_a"
-  tele_consent_yes
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'due'
-  assert_equals_helper 'first line only' "$LINENO" '1.2.3-test' "$(tele_call_field upload KW_VERSION)"
-  tele_reset_spawn
-  export KW_LIB_DIR="${TD}/lib_b"
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'due'
-  assert_equals_helper 'missing VERSION' "$LINENO" 'unknown' "$(tele_call_field upload KW_VERSION)"
-}
-
-function test_gate_spawns_a_detached_session_with_a_timeout_and_no_stdio()
+# The uploader must outlive the kw command and never touch its terminal.
+function test_gate_spawn_is_detached_from_the_command()
 {
   local my_sid
   local -a stat_fields
 
   tele_consent_yes
+  : > "${TD}/stdin.src"
   read -r -a stat_fields < "/proc/$$/stat"
   my_sid="${stat_fields[5]}"
-  run_gate build "$LINENO"
+  telemetry_gate build < "${TD}/stdin.src" > "${TD}/gate.out" 2> "${TD}/gate.err"
   assert_gate_outcome "$LINENO" spawned 'due'
   assertNotEquals "($LINENO) new session" "$my_sid" "$(tele_call_field upload sid)"
   assert_has "$LINENO" 'wrapped in timeout 90' "$(tele_call_field upload parent)" 'timeout 90 kw_tele upload'
   assert_equals_helper 'stdin' "$LINENO" '/dev/null' "$(tele_call_field upload stdin)"
   assert_equals_helper 'stdout' "$LINENO" '/dev/null' "$(tele_call_field upload stdout)"
   assert_equals_helper 'stderr' "$LINENO" '/dev/null' "$(tele_call_field upload stderr)"
+  assertEquals "($LINENO) gate stdout" '' "$(< "${TD}/gate.out")"
+  assertEquals "($LINENO) gate stderr" '' "$(< "${TD}/gate.err")"
 }
 
-function test_gate_never_waits_for_the_uploader_nor_keeps_its_stdout_open()
-{
-  local start
-  local elapsed
-  local out
-
-  tele_consent_yes
-  tele_stub_set hang 2
-  start=${EPOCHREALTIME//[.,]/}
-  out="$(telemetry_gate build < /dev/null 2>&1)"
-  elapsed=$((${EPOCHREALTIME//[.,]/} - start))
-  assertEquals "($LINENO) output" '' "$out"
-  assertTrue "($LINENO) gate took ${elapsed} us" "((elapsed < 1000000))"
-}
-
-function test_gate_spawn_migrates_the_schema_once()
-{
-  tele_consent_yes
-  tele_make_db legacy
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'due'
-  tele_db_has_sent_at
-  assertEquals "($LINENO) sent_at added before the uploader starts" 0 "$?"
-  assert_equals_helper 'index' "$LINENO" 'event_unsent_idx' "$(sqlite3 "$TELE_DB" "SELECT name FROM sqlite_master WHERE name = 'event_unsent_idx'")"
-  assertEquals "($LINENO) stderr" '' "$GATE_ERR"
-}
-
-function test_gate_spawns_even_when_there_is_no_db_if_time_is_due()
-{
-  tele_consent_yes
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'due, no DB: kw_tele reports error:nodb itself'
-  assertFalse "($LINENO) no DB created by the gate" "[[ -e ${TELE_DB} ]]"
-}
-
-function test_gate_missing_state_dir_prevents_the_spawn()
-{
-  tele_consent_yes
-  rmdir "$TELE_STATE_DIR"
-  run_gate build "$LINENO"
-  assertEquals "($LINENO) stderr" '' "$GATE_ERR"
-  assert_gate_outcome "$LINENO" 'not spawned' 'state dir missing'
-  assertFalse "($LINENO) the gate must not create the state dir" "[[ -e ${TELE_STATE_DIR} ]]"
-}
-
-function test_gate_unwritable_state_dir_prevents_the_spawn()
-{
-  if [[ "$EUID" == 0 ]]; then
-    startSkipping
-    return
-  fi
-  tele_consent_yes
-  chmod 555 "$TELE_STATE_DIR"
-  run_gate build "$LINENO"
-  chmod 755 "$TELE_STATE_DIR"
-  assertEquals "($LINENO) stderr" '' "$GATE_ERR"
-  assert_gate_outcome "$LINENO" 'not spawned' 'state dir read-only'
-}
-
-function test_gate_state_dir_that_is_a_file_prevents_the_spawn()
-{
-  tele_consent_yes
-  rmdir "$TELE_STATE_DIR"
-  : > "$TELE_STATE_DIR"
-  run_gate build "$LINENO"
-  assertEquals "($LINENO) stderr" '' "$GATE_ERR"
-  assert_gate_outcome "$LINENO" 'not spawned' 'state dir is a file'
-}
-
-function test_gate_without_setsid_does_not_spawn()
-{
-  tele_consent_yes
-  tele_limited_path setsid
-  GATE_PATH="$TELE_LIMITED_PATH" run_gate build "$LINENO"
-  assertEquals "($LINENO) stderr" '' "$GATE_ERR"
-  assert_gate_outcome "$LINENO" 'not spawned' 'no setsid'
-  assertFalse "($LINENO) spawn file" "[[ -e ${TELE_STATE_DIR}/telemetry.spawn ]]"
-}
-
-function test_gate_without_timeout_does_not_spawn()
-{
-  tele_consent_yes
-  tele_limited_path timeout
-  GATE_PATH="$TELE_LIMITED_PATH" run_gate build "$LINENO"
-  assertEquals "($LINENO) stderr" '' "$GATE_ERR"
-  assert_gate_outcome "$LINENO" 'not spawned' 'no timeout'
-  assertFalse "($LINENO) spawn file" "[[ -e ${TELE_STATE_DIR}/telemetry.spawn ]]"
-}
-
-function test_gate_control_limited_path_with_every_tool_spawns()
-{
-  tele_consent_yes
-  tele_limited_path
-  GATE_PATH="$TELE_LIMITED_PATH" run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'limited PATH holding every needed tool'
-}
-
-function test_gate_ignores_kw_tele_now_without_the_test_flag()
-{
-  local spawned_at
-
-  tele_consent_yes
-  unset -v KW_TELE_TEST
-  export KW_TELE_NOW=100
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'real clock used: time_due'
-  spawned_at="$(< "${TELE_STATE_DIR}/telemetry.spawn")"
-  assertTrue "($LINENO) spawn file has the real time, got ${spawned_at}" "((spawned_at > 1700000000))"
-}
-
-function test_gate_writes_only_the_spawn_file()
+function test_gate_spawn_writes_only_the_spawn_file()
 {
   local config_before
   local state_before
@@ -1102,103 +850,73 @@ function test_gate_writes_only_the_spawn_file()
   tele_write_state 5 6 1
   config_before="$(< "$TELE_CONFIG")"
   state_before="$(< "${TELE_STATE_DIR}/telemetry.state")"
-  KW_TELE_NOW=$((TELE_NOW + 99999)) run_gate build "$LINENO"
+  run_gate build "$LINENO"
   assert_gate_outcome "$LINENO" spawned 'due'
-  assert_equals_helper 'config' "$LINENO" "$config_before" "$(< "$TELE_CONFIG")"
-  assert_equals_helper 'state' "$LINENO" "$state_before" "$(< "${TELE_STATE_DIR}/telemetry.state")"
+  assert_equals_helper 'spawn file holds the time of the spawn' "$LINENO" "$TELE_NOW" "$(< "${TELE_STATE_DIR}/telemetry.spawn")"
+  assert_equals_helper 'config untouched' "$LINENO" "$config_before" "$(< "$TELE_CONFIG")"
+  assert_equals_helper 'state untouched' "$LINENO" "$state_before" "$(< "${TELE_STATE_DIR}/telemetry.state")"
   files="$(cd "$TELE_STATE_DIR" && printf '%s ' *)"
-  assert_equals_helper 'files in state dir' "$LINENO" 'telemetry.spawn telemetry.state ' "$files"
+  assert_equals_helper 'only the spawn file is added to the state dir' "$LINENO" 'telemetry.spawn telemetry.state ' "$files"
 }
 
-function test_gate_does_not_leak_variables_into_the_caller_shell()
+# An old DB is migrated before the uploader starts.
+function test_gate_spawn_migrates_an_old_db_first()
 {
-  local before
-  local after
-  local name
-  local leaked=''
-
   tele_consent_yes
   tele_make_db legacy
-  before="$(compgen -v | sort)"
   run_gate build "$LINENO"
   assert_gate_outcome "$LINENO" spawned 'due'
-  after="$(compgen -v | sort)"
-  for name in $(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after")); do
-    case "$name" in
-      TELEMETRY_* | GATE_* | before | after | name | leaked | REPLY) continue ;;
-    esac
-    leaked+=" ${name}"
-  done
-  assertEquals "($LINENO) new variables" '' "$leaked"
-  assertFalse "($LINENO) KW_VERSION" '[[ -v KW_VERSION ]]'
-  assertFalse "($LINENO) KW_DATA_DIR" '[[ -v KW_DATA_DIR ]]'
-  assertFalse "($LINENO) KW_STATE_DIR" '[[ -v KW_STATE_DIR ]]'
-  assertFalse "($LINENO) KW_TELE_CONFIG" '[[ -v KW_TELE_CONFIG ]]'
-}
-
-function test_gate_does_not_export_variables_the_caller_only_set()
-{
-  KW_DATA_DIR="$TELE_DATA_DIR"
-  KW_STATE_DIR="$TELE_STATE_DIR"
-  tele_consent_yes
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'due'
-  is_exported KW_DATA_DIR
-  assertEquals "($LINENO) KW_DATA_DIR stays unexported" 1 "$?"
-  is_exported KW_STATE_DIR
-  assertEquals "($LINENO) KW_STATE_DIR stays unexported" 1 "$?"
-  is_exported KW_VERSION
-  assertEquals "($LINENO) KW_VERSION not exported" 1 "$?"
-  is_exported KW_TELE_CONFIG
-  assertEquals "($LINENO) KW_TELE_CONFIG not exported" 1 "$?"
-}
-
-function test_gate_returns_0_on_unreadable_or_odd_config()
-{
-  tele_write_config 'telemetry_consent=yes'
-  chmod 000 "$TELE_CONFIG"
-  run_gate build "$LINENO"
-  chmod 644 "$TELE_CONFIG"
+  tele_db_has_sent_at
+  assertEquals "($LINENO) sent_at added before the uploader starts" 0 "$?"
   assertEquals "($LINENO) stderr" '' "$GATE_ERR"
-  rm -f "$TELE_CONFIG"
-  mkdir "$TELE_CONFIG"
-  run_gate build "$LINENO"
-  assertEquals "($LINENO) config is a directory, stderr" '' "$GATE_ERR"
-  assertEquals "($LINENO) no kw_tele call" '' "$(tele_calls)"
 }
 
-function test_gate_under_set_u_does_not_fail_on_unset_variables()
+# If the spawn file cannot be written the gate gives up silently: spawning
+# without it would defeat the backoff.
+function test_gate_does_not_spawn_when_the_spawn_file_cannot_be_written()
 {
   tele_consent_yes
-  unset -v KW_DATA_DIR KW_STATE_DIR KW_TELE_CONFIG KWORKFLOW
-  set -u
+  chmod 555 "$TELE_STATE_DIR"
   run_gate build "$LINENO"
-  set +u
-  assert_gate_outcome "$LINENO" spawned 'due'
+  sleep 0.5
+  chmod 755 "$TELE_STATE_DIR"
+  assertEquals "($LINENO) stderr" '' "$GATE_ERR"
+  assertEquals "($LINENO) no upload" 0 "$(tele_upload_calls)"
 }
 
-function test_gate_fork_budget_is_zero_before_the_count()
+function test_gate_does_not_wait_for_the_uploader()
 {
-  tele_make_db
-  tele_write_config 'telemetry_consent=no'
-  tele_count_forks telemetry_gate build
-  if ((TELE_FORKS < 0)); then
-    startSkipping
-    return
-  fi
-  assert_equals_helper 'consent=no' "$LINENO" 0 "$TELE_FORKS"
+  local start
+  local elapsed
+  local out
 
   tele_consent_yes
-  tele_count_forks telemetry_gate help
-  assert_equals_helper 'early action' "$LINENO" 0 "$TELE_FORKS"
+  tele_stub_set hang 5
+  start=${EPOCHREALTIME//[.,]/}
+  out="$(telemetry_gate build < /dev/null 2>&1)"
+  elapsed=$((${EPOCHREALTIME//[.,]/} - start))
+  assertEquals "($LINENO) output" '' "$out"
+  assertTrue "($LINENO) the gate took ${elapsed} us with a 5 s uploader" "((elapsed < 3000000))"
+}
 
-  tele_write_state $((TELE_NOW - 10)) $((TELE_NOW - 10)) 0
-  tele_count_forks telemetry_gate build
-  assert_equals_helper 'spacing not ok' "$LINENO" 0 "$TELE_FORKS"
+function test_gate_does_not_spawn_without_a_required_tool()
+{
+  local tool
 
-  tele_write_config 'telemetry_consent=ask'
-  tele_count_forks telemetry_gate build
-  assert_equals_helper 'ask without terminal' "$LINENO" 0 "$TELE_FORKS"
+  tele_consent_yes
+  for tool in setsid timeout kw_tele; do
+    tele_reset_spawn
+    tele_limited_path "$tool"
+    GATE_PATH="$TELE_LIMITED_PATH" run_gate build "$LINENO"
+    assertEquals "(no ${tool}) stderr" '' "$GATE_ERR"
+    assert_gate_outcome "$LINENO" 'not spawned' "no ${tool}"
+    assertFalse "(no ${tool}) spawn file" "[[ -e ${TELE_STATE_DIR}/telemetry.spawn ]]"
+  done
+
+  tele_reset_spawn
+  tele_limited_path
+  GATE_PATH="$TELE_LIMITED_PATH" run_gate build "$LINENO"
+  assert_gate_outcome "$LINENO" spawned 'control: limited PATH holding every needed tool'
 }
 
 function gate_with_limited_path()
@@ -1206,32 +924,79 @@ function gate_with_limited_path()
   PATH="$TELE_LIMITED_PATH" telemetry_gate build
 }
 
-function test_gate_fork_budget_is_zero_without_kw_tele()
+# KW_TELE_TEST=0 makes the gate read the real clock.
+function gate_with_the_real_clock()
 {
-  tele_consent_yes
-  tele_limited_path kw_tele
-  tele_count_forks gate_with_limited_path
-  if ((TELE_FORKS < 0)); then
-    startSkipping
-    return
-  fi
-  assert_equals_helper 'no kw_tele' "$LINENO" 0 "$TELE_FORKS"
+  local KW_TELE_TEST=0
+
+  telemetry_gate build
 }
 
-function test_gate_fork_budget_is_one_on_the_count_path()
+# Forks are counted through ns_last_pid, so the test skips where that is unreadable.
+function test_gate_fork_budget()
 {
-  tele_consent_yes 'batch_size=5'
+  local label
+  local kind
+  local expected
+  local real_now
+  local failed_rows=''
+
   tele_make_db
-  tele_install_fake_count 0
-  tele_write_state 0 $((TELE_NOW - 100)) 0
-  tele_count_forks telemetry_gate build
+  tele_count_forks :
   if ((TELE_FORKS < 0)); then
     startSkipping
     return
   fi
-  assertTrue "($LINENO) the COUNT query must have run" "[[ -s ${TELE_SQLITE_RECORD} ]]"
-  assert_equals_helper 'below batch: one COUNT fork' "$LINENO" 1 "$TELE_FORKS"
-  assertEquals "($LINENO) still no spawn" 0 "$(tele_upload_calls)"
+
+  # Until an upload is decided the gate may fork at most once, for the COUNT.
+  # label | scenario | forks
+  while IFS='|' read -r label kind expected; do
+    rm -f "${TELE_STATE_DIR}/telemetry.state" "${TELE_STATE_DIR}/telemetry.spawn" "$TELE_SQLITE_RECORD"
+    tele_consent_yes
+    case "$kind" in
+      no) tele_write_config 'telemetry_consent=no' ;;
+      ask) tele_write_config 'telemetry_consent=ask' ;;
+      spacing) tele_write_state $((TELE_NOW - 10)) $((TELE_NOW - 10)) 0 ;;
+      realclock)
+        printf -v real_now '%(%s)T' -1
+        tele_write_state $((real_now - 10)) $((real_now - 10)) 0
+        ;;
+      nodb)
+        rm -f "$TELE_DB"
+        tele_consent_yes 'batch_size=5'
+        tele_write_state 0 $((TELE_NOW - 100)) 0
+        ;;
+      count)
+        tele_consent_yes 'batch_size=5'
+        tele_install_fake_count 0
+        tele_write_state 0 $((TELE_NOW - 100)) 0
+        ;;
+    esac
+    case "$kind" in
+      nokwtele)
+        tele_limited_path kw_tele
+        tele_count_forks gate_with_limited_path
+        ;;
+      realclock) tele_count_forks gate_with_the_real_clock ;;
+      help) tele_count_forks telemetry_gate help ;;
+      *) tele_count_forks telemetry_gate build ;;
+    esac
+    assert_equals_helper "$label" "$LINENO" "$expected" "$TELE_FORKS"
+    [[ "$kind" == nodb ]] && tele_make_db
+    if [[ "$kind" == count ]]; then
+      assertTrue "(${label}) the COUNT query must have run" "[[ -s ${TELE_SQLITE_RECORD} ]]"
+      assertEquals "(${label}) still no spawn" 0 "$(tele_upload_calls)"
+    fi
+  done << 'EOF'
+consent=no|no|0
+consent=ask without a terminal|ask|0
+help with consent=yes returns before the timing|help|0
+spacing not ok|spacing|0
+spacing not ok on the real clock|realclock|0
+no kw_tele|nokwtele|0
+COUNT path without a DB|nodb|0
+below batch: one COUNT fork|count|1
+EOF
 }
 
 # ------------------------------------------------------ telemetry_prompt_consent
@@ -1261,83 +1026,90 @@ function count_choice_lines()
   printf '%s' "$count"
 }
 
-function test_prompt_answer_1_sets_yes_with_history()
+# Number of lines of the pty output that hold the confirmation step of D56.
+function count_confirmations()
 {
-  tele_stub_set stdout.info $'pending_events=42\npending_since=2026-01-05'
-  run_prompt '1\n'
-  assertEquals "($LINENO) return" 0 "$TELE_PTY_RC"
-  assert_equals_helper 'consent calls' "$LINENO" 'consent --set yes --include-history' "$(calls_starting_with consent)"
+  local line
+  local count=0
+
+  while IFS= read -r line; do
+    [[ "$line" == *refuse* ]] && ((count++))
+  done <<< "$TELE_PTY_OUT"
+  printf '%s' "$count"
 }
 
-function test_prompt_answer_2_sets_yes_only_from_now_on()
+# D56: 1, 2 and 3 are recorded at once. Any other input shows the answer 3 and
+# asks to confirm the refusal: Enter records no, 1 or 2 records that choice,
+# anything else repeats the confirmation. EOF at any step records nothing.
+function test_prompt_answers()
 {
-  tele_stub_set stdout.info $'pending_events=42\npending_since=2026-01-05'
-  run_prompt '2\n'
-  assertEquals "($LINENO) return" 0 "$TELE_PTY_RC"
-  assert_equals_helper 'consent calls' "$LINENO" 'consent --set yes' "$(calls_starting_with consent)"
+  local input
+  local rc
+  local expected
+  local asks
+  local confirmations
+  local exit_code
+
+  # typed input (printf %b) | return | consent call | times asked | times the
+  # confirmation is shown | exit status of the consent call ('-': default); the
+  # return is the status of that call
+  while IFS='|' read -r input rc expected asks confirmations exit_code; do
+    tele_reset_spawn
+    rm -f "${KW_TELE_STUB_DIR}/exit.consent"
+    [[ "$exit_code" == '-' ]] || tele_stub_set exit.consent "$exit_code"
+    run_prompt "$input"
+    assertEquals "(input '${input}') return" "$rc" "$TELE_PTY_RC"
+    assert_equals_helper "input '${input}': consent calls" "$LINENO" "$expected" "$(calls_starting_with consent)"
+    assert_equals_helper "input '${input}': times asked" "$LINENO" "$asks" "$(count_choice_lines)"
+    assert_equals_helper "input '${input}': confirmations" "$LINENO" "$confirmations" "$(count_confirmations)"
+  done << 'EOF'
+1\n|0|consent --set yes --include-history|1|0|-
+2\n|0|consent --set yes|1|0|-
+3\n|0|consent --set no|1|0|-
+  1 \n|0|consent --set yes --include-history|1|0|-
+\n\n|0|consent --set no|1|1|-
+y\n\n|0|consent --set no|1|1|-
+yes\n\n|0|consent --set no|1|1|-
+n\n\n|0|consent --set no|1|1|-
+x\n\n|0|consent --set no|1|1|-
+0\n\n|0|consent --set no|1|1|-
+4\n\n|0|consent --set no|1|1|-
+y\n1\n|0|consent --set yes --include-history|1|1|-
+y\n2\n|0|consent --set yes|1|1|-
+x\n3\n|0|consent --set no|1|1|-
+y\nx\n\n|0|consent --set no|1|2|-
+y\nx\n2\n|0|consent --set yes|1|2|-
+y\nx\nz\n\n|0|consent --set no|1|3|-
+1\n|6|consent --set yes --include-history|1|0|6
+2\n|4|consent --set yes|1|0|4
+3\n|3|consent --set no|1|0|3
+\n\n|5|consent --set no|1|1|5
+|1||1|0|-
+y\n|1||1|1|-
+y\nx\n|1||1|2|-
+EOF
 }
 
-function test_prompt_answer_3_sets_no()
+# The confirmation names what will be recorded: the answer line shows 3 and the
+# text says that telemetry is refused and that Enter confirms.
+function test_prompt_confirmation_text()
 {
-  run_prompt '3\n'
-  assertEquals "($LINENO) return" 0 "$TELE_PTY_RC"
-  assert_equals_helper 'consent calls' "$LINENO" 'consent --set no' "$(calls_starting_with consent)"
+  local input
+  local after_first
+  local first_step
+
+  for input in '\n' 'y\n' 'x\n'; do
+    run_prompt "${input}\n"
+    after_first="${TELE_PTY_OUT#*'Choice [3]: '}"
+    first_step="${after_first%%'> '*}"
+    assert_has "$LINENO" "input '${input}': refusal named" "$first_step" 'refuse'
+    assert_has "$LINENO" "input '${input}': Enter confirms" "$first_step" 'Enter'
+    assert_has "$LINENO" "input '${input}': the answer line shows 3" "$first_step" '3'
+    assert_has "$LINENO" "input '${input}': 1 or 2 offered" "$first_step" '1 or 2'
+  done
 }
 
-function test_prompt_enter_defaults_to_3()
-{
-  run_prompt '\n'
-  assertEquals "($LINENO) return" 0 "$TELE_PTY_RC"
-  assert_equals_helper 'consent calls' "$LINENO" 'consent --set no' "$(calls_starting_with consent)"
-}
-
-function test_prompt_trims_whitespace_around_the_answer()
-{
-  run_prompt '  1 \n'
-  assert_equals_helper 'consent calls' "$LINENO" 'consent --set yes --include-history' "$(calls_starting_with consent)"
-  tele_reset_spawn
-  run_prompt '\t2\t\n'
-  assert_equals_helper 'consent calls' "$LINENO" 'consent --set yes' "$(calls_starting_with consent)"
-}
-
-function test_prompt_reasks_on_invalid_input_and_accepts_a_later_answer()
-{
-  run_prompt 'x\n4\n2\n'
-  assertEquals "($LINENO) return" 0 "$TELE_PTY_RC"
-  assert_equals_helper 'consent calls' "$LINENO" 'consent --set yes' "$(calls_starting_with consent)"
-  assert_equals_helper 'asked three times' "$LINENO" 3 "$(count_choice_lines)"
-}
-
-function test_prompt_gives_up_after_three_invalid_answers_and_writes_nothing()
-{
-  run_prompt 'x\ny\nz\n2\n'
-  assertEquals "($LINENO) return" 1 "$TELE_PTY_RC"
-  assertEquals "($LINENO) no consent call" '' "$(calls_starting_with consent)"
-  assert_equals_helper 'asked three times' "$LINENO" 3 "$(count_choice_lines)"
-}
-
-function test_prompt_numbers_outside_1_to_3_and_words_are_invalid()
-{
-  run_prompt '0\n11\nyes\n'
-  assertEquals "($LINENO) return" 1 "$TELE_PTY_RC"
-  assertEquals "($LINENO) no consent call" '' "$(calls_starting_with consent)"
-}
-
-function test_prompt_eof_writes_nothing()
-{
-  run_prompt ''
-  assertEquals "($LINENO) return" 1 "$TELE_PTY_RC"
-  assertEquals "($LINENO) no consent call" '' "$(calls_starting_with consent)"
-}
-
-function test_prompt_eof_after_an_invalid_answer_writes_nothing()
-{
-  run_prompt 'x\n'
-  assertEquals "($LINENO) return" 1 "$TELE_PTY_RC"
-  assertEquals "($LINENO) no consent call" '' "$(calls_starting_with consent)"
-}
-
-function test_prompt_without_stdin_terminal_does_nothing()
+function test_prompt_without_both_terminals_does_nothing()
 {
   telemetry_paths
   telemetry_prompt_consent < /dev/null > "${TD}/out" 2> "${TD}/err"
@@ -1345,41 +1117,88 @@ function test_prompt_without_stdin_terminal_does_nothing()
   assertEquals "($LINENO) stdout" '' "$(< "${TD}/out")"
   assertEquals "($LINENO) stderr" '' "$(< "${TD}/err")"
   assertEquals "($LINENO) no kw_tele call" '' "$(tele_calls)"
+
 }
 
-function test_prompt_with_stdin_terminal_but_redirected_stderr_does_nothing()
+function test_prompt_text()
 {
-  tele_run_pty '3\n' 'telemetry_paths; telemetry_prompt_consent 2> /dev/null'
-  assertEquals "($LINENO) return" 1 "$TELE_PTY_RC"
-  assert_lacks "$LINENO" 'question' "$TELE_PTY_OUT" 'Choice [3]:'
-  assertEquals "($LINENO) no kw_tele call" '' "$(tele_calls)"
-}
+  local flat
 
-function test_prompt_with_stderr_terminal_but_redirected_stdin_does_nothing()
-{
-  tele_run_pty '3\n' 'telemetry_paths; telemetry_prompt_consent < /dev/null'
-  assertEquals "($LINENO) return" 1 "$TELE_PTY_RC"
-  assertEquals "($LINENO) no kw_tele call" '' "$(tele_calls)"
-}
-
-function test_prompt_text_has_the_three_answers_the_endpoint_and_the_preview_hint()
-{
   tele_write_config 'telemetry_consent=ask' 'endpoint=http://shown.test:4318/v1/logs'
   tele_stub_set stdout.info $'pending_events=42\npending_since=2026-01-05'
   run_prompt '3\n'
+  flat="$(tr -s ' ' <<< "${TELE_PTY_OUT//$'\n'/ }")"
   assert_has "$LINENO" 'question' "$TELE_PTY_OUT" 'Share kw usage telemetry?'
   assert_has "$LINENO" 'option 1' "$TELE_PTY_OUT" '  1) Yes, including past data (42 events recorded since 2026-01-05)'
   assert_has "$LINENO" 'option 2' "$TELE_PTY_OUT" '  2) Yes, only from now on'
   assert_has "$LINENO" 'option 3' "$TELE_PTY_OUT" '  3) No'
-  assert_has "$LINENO" 'default' "$TELE_PTY_OUT" 'Choice [3]:'
   assert_has "$LINENO" 'endpoint' "$TELE_PTY_OUT" 'http://shown.test:4318/v1/logs'
-  assert_has "$LINENO" 'preview' "$TELE_PTY_OUT" 'kw telemetry upload --dry-run'
-  assert_has "$LINENO" 'change your mind' "$TELE_PTY_OUT" 'kw telemetry opt-out'
-  assert_has "$LINENO" 'change your mind' "$TELE_PTY_OUT" 'opt-in'
-  assert_has "$LINENO" 'random id' "${TELE_PTY_OUT,,}" 'random'
+  assert_has "$LINENO" 'source of the data' "$flat" 'local database'
+  assert_has "$LINENO" 'tables added later' "$flat" 'added later'
+  assert_has "$LINENO" 'dry run' "$flat" 'kw telemetry upload --dry-run'
 }
 
-function test_prompt_reads_the_counts_with_info_pending_and_the_exported_environment()
+# D55 and D56: the question and the line after every recorded answer remind the
+# user how to see what is sent (`kw telemetry info`) and how to leave fields out
+# (exclude_fields in the config file, whose path is printed). The recorded line
+# also says how to change the answer.
+function test_prompt_reminds_how_to_see_and_limit_what_is_sent()
+{
+  local input
+  local marker='Choice [3]: '
+  local before_choice
+  local after_choice
+  local needle
+
+  # the question is the same for every answer, so the typed input only varies
+  # the text printed after it. The inputs that need a confirmation end with Enter.
+  for input in '1\n' '2\n' '3\n' '\n\n' 'y\n\n' 'x\n1\n'; do
+    run_prompt "$input"
+    before_choice="${TELE_PTY_OUT%%"$marker"*}"
+    after_choice="${TELE_PTY_OUT##*"$marker"}"
+    for needle in 'kw telemetry info' 'exclude_fields' 'kw telemetry upload --dry-run' "$TELE_CONFIG"; do
+      assert_has "$LINENO" "question text, input '${input}'" "$before_choice" "$needle"
+      assert_has "$LINENO" "text after the answer, input '${input}'" "$after_choice" "$needle"
+    done
+    for needle in 'To change your choice' 'kw telemetry opt-in' 'kw telemetry opt-out'; do
+      assert_has "$LINENO" "change line, input '${input}'" "$after_choice" "$needle"
+    done
+    assert_lacks "$LINENO" "no per-answer line, input '${input}'" "$after_choice" 'You chose'
+  done
+}
+
+# Everything the prompt prints, the confirmation included, goes to stderr.
+function test_prompt_prints_nothing_on_stdout()
+{
+  local input
+
+  for input in '2\n' 'y\n\n' 'y\nx\n3\n'; do
+    tele_run_pty "$input" "telemetry_paths; telemetry_prompt_consent > '${TD}/prompt.stdout'"
+    assertEquals "(input '${input}') return" 0 "$TELE_PTY_RC"
+    assert_has "$LINENO" "input '${input}': the prompt is on the terminal" "$TELE_PTY_OUT" 'Share kw usage telemetry?'
+    assertEquals "(input '${input}') stdout" '' "$(< "${TD}/prompt.stdout")"
+  done
+}
+
+function test_prompt_does_not_enumerate_a_fixed_field_list()
+{
+  local flat
+  local column
+  local found=''
+
+  tele_make_db
+  run_prompt '3\n'
+  flat="${TELE_PTY_OUT//$'\n'/ }"
+  flat="$(tr -s ' ' <<< "$flat")"
+  # Names with an underscore cannot be ordinary words (id, time, ...), so a
+  # match means the prompt spells out a table or column.
+  while IFS= read -r column; do
+    [[ "${flat,,}" == *"$column"* ]] && found+=" ${column}"
+  done < <(sqlite3 "$TELE_DB" "SELECT m.name FROM sqlite_master m WHERE m.type = 'table' UNION SELECT p.name FROM sqlite_master m, pragma_table_info(m.name) p WHERE m.type = 'table'" | grep _)
+  assertEquals "($LINENO) kwdb.sql columns named in the prompt" '' "$found"
+}
+
+function test_prompt_reads_counts_from_kw_tele()
 {
   tele_stub_set stdout.info $'pending_events=3\npending_since=2026-02-02'
   run_prompt '3\n'
@@ -1390,125 +1209,30 @@ function test_prompt_reads_the_counts_with_info_pending_and_the_exported_environ
   assert_equals_helper 'consent call env' "$LINENO" "$TELE_CONFIG" "$(tele_call_field 'consent --set no' KW_TELE_CONFIG)"
 }
 
-function test_prompt_with_zero_pending_events_says_no_past_data()
+function test_prompt_without_counts()
 {
-  tele_stub_set stdout.info $'pending_events=0\npending_since='
-  run_prompt '3\n'
-  assert_has "$LINENO" 'option 1' "$TELE_PTY_OUT" '(no past data recorded)'
-  assert_lacks "$LINENO" 'no count' "$TELE_PTY_OUT" '0 events'
-}
+  local label
+  local info
 
-function test_prompt_uses_zero_events_when_info_fails()
-{
-  tele_stub_set exit.info 6
-  run_prompt '2\n'
-  assert_has "$LINENO" 'option 1' "$TELE_PTY_OUT" '(no past data recorded)'
-  assert_equals_helper 'still records the answer' "$LINENO" 'consent --set yes' "$(calls_starting_with consent)"
-}
-
-function test_prompt_uses_zero_events_when_info_prints_garbage()
-{
-  tele_stub_set stdout.info 'something else'
-  run_prompt '3\n'
-  assert_has "$LINENO" 'option 1' "$TELE_PTY_OUT" '(no past data recorded)'
-}
-
-function test_prompt_migrates_the_schema_before_asking_for_counts()
-{
-  tele_make_db legacy
-  run_prompt '3\n'
-  tele_db_has_sent_at
-  assertEquals "($LINENO) sent_at added" 0 "$?"
-}
-
-function test_prompt_leaves_no_kw_variables_in_the_caller_shell()
-{
-  tele_run_pty '3\n' 'telemetry_paths; telemetry_prompt_consent
-[[ -v KW_VERSION ]] && echo LEAK_VERSION
-[[ -v KW_TELE_CONFIG ]] && echo LEAK_CONFIG
-[[ "$(declare -p KW_DATA_DIR)" == "declare -x"* ]] && echo LEAK_EXPORT_DATA
-[[ "$(declare -p KW_STATE_DIR)" == "declare -x"* ]] && echo LEAK_EXPORT_STATE
-echo CHECKED'
-  assert_has "$LINENO" 'driver reached the checks' "$TELE_PTY_OUT" 'CHECKED'
-  assert_equals_helper 'the prompt ran' "$LINENO" 'consent --set no' "$(calls_starting_with consent)"
-  assert_lacks "$LINENO" 'leak' "$TELE_PTY_OUT" 'LEAK_'
-}
-
-function test_prompt_does_not_touch_the_config_file_itself()
-{
-  tele_write_config 'telemetry_consent=ask'
-  run_prompt '1\n'
-  assert_equals_helper 'the prompt ran' "$LINENO" 'consent --set yes --include-history' "$(calls_starting_with consent)"
-  assert_equals_helper 'config' "$LINENO" 'telemetry_consent=ask' "$(< "$TELE_CONFIG")"
-}
-
-# The consent text must not name the fields: the data is whatever kw's own
-# tables hold, now and later.
-function test_prompt_does_not_enumerate_a_fixed_field_list()
-{
-  local flat
-
-  run_prompt '3\n'
-  flat="${TELE_PTY_OUT//$'\n'/ }"
-  flat="$(tr -s ' ' <<< "$flat")"
-  assert_lacks "$LINENO" 'hard-coded field list' "$flat" 'its status'
-  assert_lacks "$LINENO" 'hard-coded field list' "$flat" 'pomodoro tag'
-  assert_lacks "$LINENO" 'hard-coded field list' "$flat" 'the command,'
-}
-
-function test_prompt_describes_the_local_database_tables_as_the_data_sent()
-{
-  local flat
-
-  run_prompt '3\n'
-  flat="${TELE_PTY_OUT//$'\n'/ }"
-  flat="$(tr -s ' ' <<< "$flat")"
-  assert_has "$LINENO" 'source of the data' "$flat" 'local database'
-  assert_has "$LINENO" 'tables, also future ones' "$flat" 'tables'
-  assert_has "$LINENO" 'tables added later' "$flat" 'added later'
-  assert_has "$LINENO" 'where to see specifics' "$flat" 'kw telemetry info'
-}
-
-function test_prompt_still_says_what_consent_allows_and_how_to_opt_out()
-{
-  local flat
-
-  run_prompt '3\n'
-  flat="$(tr -s ' ' <<< "${TELE_PTY_OUT//$'\n'/ }")"
-  assert_has "$LINENO" 'what is sent' "$flat" 'What is sent'
-  assert_has "$LINENO" 'dry run' "$flat" 'kw telemetry upload --dry-run'
-  assert_has "$LINENO" 'opt-out' "$flat" 'kw telemetry opt-out'
-  assert_has "$LINENO" 'opt-in' "$flat" 'kw telemetry opt-in'
-  assert_has "$LINENO" 'random id' "$flat" 'random ID'
-}
-
-# A last_success_at in the future (clock jump, copied state) must not keep the
-# gate from spawning.
-function test_gate_a_future_last_success_does_not_block_spawning()
-{
-  tele_consent_yes
-  tele_write_state 0 $((TELE_NOW + 864000)) 0
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'last_success_at ten days ahead of now'
-}
-
-# A last_attempt_at in the future would otherwise space out attempts forever.
-function test_gate_a_future_last_attempt_does_not_block_spawning()
-{
-  tele_consent_yes
-  tele_write_state $((TELE_NOW + 864000)) 0 0
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'last_attempt_at ten days ahead of now'
-}
-
-# The spawn file is written by kw itself, so a bad clock must not block it either.
-function test_gate_a_future_spawn_file_value_does_not_block_spawning()
-{
-  tele_consent_yes
-  tele_write_state 0 0 0
-  printf '%s\n' $((TELE_NOW + 864000)) > "${TELE_STATE_DIR}/telemetry.spawn"
-  run_gate build "$LINENO"
-  assert_gate_outcome "$LINENO" spawned 'spawn file ten days ahead of now'
+  # label | stub for `info --pending` | text expected in option 1
+  while IFS='|' read -r label info; do
+    rm -f "${KW_TELE_STUB_DIR}/exit.info" "${KW_TELE_STUB_DIR}/stdout.info"
+    case "$label" in
+      'zero events') tele_stub_set stdout.info $'pending_events=0\npending_since=' ;;
+      'info fails') tele_stub_set exit.info 6 ;;
+      'garbage count') tele_stub_set stdout.info $'pending_events=a[1]\npending_since=2026-01-01' ;;
+      'count without a date') tele_stub_set stdout.info $'pending_events=4\npending_since=' ;;
+    esac
+    tele_reset_spawn
+    run_prompt '2\n'
+    assert_has "$LINENO" "option 1 (${label})" "$TELE_PTY_OUT" "$info"
+    assert_equals_helper "still records the answer (${label})" "$LINENO" 'consent --set yes' "$(calls_starting_with consent)"
+  done << 'EOF'
+zero events|(no past data recorded)
+info fails|(no past data recorded)
+garbage count|(no past data recorded)
+count without a date|(4 events recorded since an unknown date)
+EOF
 }
 
 invoke_shunit

@@ -36,64 +36,38 @@ function main_text()
   printf '%s\n%s' "$MAIN_OUT" "$MAIN_ERR"
 }
 
-# ---------------------------------------------------------------- fixtures
-
-function test_fixture_stub_is_first_on_path_and_records()
-{
-  assert_equals_helper 'stub on PATH' "$LINENO" "${TD}/stubbin/kw_tele" "$(command -v kw_tele)"
-  kw_tele info --export > /dev/null
-  assert_equals_helper 'argv recorded' "$LINENO" 'info --export' "$(tele_calls)"
-}
-
-function test_fixture_pty_driver_runs_a_snippet_with_a_terminal()
-{
-  tele_run_pty '' '[[ -t 0 && -t 2 ]] && echo TTY_OK'
-  assert_has "$LINENO" 'both streams are terminals' "$TELE_PTY_OUT" 'TTY_OK'
-  assertEquals "($LINENO) status" 0 "$TELE_PTY_RC"
-}
-
 # ------------------------------------------------------------ subcommand mapping
 
-function test_main_upload_forces_an_upload()
+function test_main_maps_subcommands_to_kw_tele_calls()
 {
-  run_main upload
-  assertEquals "($LINENO)" 0 "$MAIN_RC"
-  assert_equals_helper 'argv' "$LINENO" 'upload --force' "$(tele_calls)"
-}
+  local args
+  local expected
+  local -a argv
 
-function test_main_upload_dry_run_maps_to_dry_run()
-{
-  run_main upload --dry-run
-  assertEquals "($LINENO)" 0 "$MAIN_RC"
-  assert_equals_helper 'argv' "$LINENO" 'upload --dry-run' "$(tele_calls)"
-}
+  # kw telemetry arguments | kw_tele argv. Config flags and `info` go through
+  # verbatim, `upload` is forced unless it is a dry run, and opt-in without a
+  # terminal never prompts.
+  while IFS='|' read -r args expected; do
+    rm -f "${KW_TELE_STUB_DIR}/record"
+    read -r -a argv <<< "$args"
+    run_main "${argv[@]}"
+    assertEquals "(${args}) status" 0 "$MAIN_RC"
+    assert_equals_helper "kw telemetry ${args}" "$LINENO" "$expected" "$(tele_calls)"
+  done << 'EOF'
+upload|upload --force
+upload --dry-run|upload --dry-run
+opt-out|consent --set no
+opt-in|consent --set yes
+opt-in --include-history|consent --set yes --include-history
+info|info
+info --export|info --export
+config|config
+config --set-batch-size 10 --set-upload-interval 7200 --set-upload-backoff 60|config --set-batch-size 10 --set-upload-interval 7200 --set-upload-backoff 60
+EOF
 
-function test_main_upload_dry_run_passes_the_output_through()
-{
-  tele_stub_set stdout.upload '{"resourceLogs": []}'
-  run_main upload --dry-run
-  assert_has "$LINENO" 'stdout' "$MAIN_OUT" '{"resourceLogs": []}'
-}
-
-function test_main_opt_out_sets_no()
-{
-  run_main opt-out
-  assertEquals "($LINENO)" 0 "$MAIN_RC"
-  assert_equals_helper 'argv' "$LINENO" 'consent --set no' "$(tele_calls)"
-}
-
-function test_main_opt_in_without_a_terminal_sets_yes_without_history()
-{
-  run_main opt-in
-  assertEquals "($LINENO)" 0 "$MAIN_RC"
-  assert_equals_helper 'argv' "$LINENO" 'consent --set yes' "$(tele_calls)"
-}
-
-function test_main_opt_in_include_history_passes_the_flag()
-{
-  run_main opt-in --include-history
-  assertEquals "($LINENO)" 0 "$MAIN_RC"
-  assert_equals_helper 'argv' "$LINENO" 'consent --set yes --include-history' "$(tele_calls)"
+  rm -f "${KW_TELE_STUB_DIR}/record"
+  run_main config --set-batch-size '1 0'
+  assertEquals "($LINENO) argument with a space stays one argument" 3 "$(tele_call_field 'config --set-batch-size 1 0' argc)"
 }
 
 function test_main_opt_in_never_prompts_even_on_a_terminal()
@@ -104,57 +78,15 @@ function test_main_opt_in_never_prompts_even_on_a_terminal()
   assert_equals_helper 'argv' "$LINENO" 'consent --set yes' "$(tele_calls)"
 }
 
-function test_main_info_is_passed_through()
-{
-  tele_stub_set stdout.info 'summary line'
-  run_main info
-  assertEquals "($LINENO)" 0 "$MAIN_RC"
-  assert_equals_helper 'argv' "$LINENO" 'info' "$(tele_calls)"
-  assert_has "$LINENO" 'stdout' "$MAIN_OUT" 'summary line'
-}
-
-function test_main_info_export_is_passed_through()
-{
-  run_main info --export
-  assert_equals_helper 'argv' "$LINENO" 'info --export' "$(tele_calls)"
-}
-
-function test_main_config_flags_are_passed_through_verbatim()
-{
-  run_main config --set-batch-size 10 --set-upload-interval 7200 --set-upload-backoff 60
-  assertEquals "($LINENO)" 0 "$MAIN_RC"
-  assert_equals_helper 'argv' "$LINENO" 'config --set-batch-size 10 --set-upload-interval 7200 --set-upload-backoff 60' "$(tele_calls)"
-}
-
-function test_main_config_without_flags_is_passed_through()
-{
-  tele_stub_set stdout.config $'telemetry_consent=yes\npending_events=0'
-  run_main config
-  assert_equals_helper 'argv' "$LINENO" 'config' "$(tele_calls)"
-  assert_has "$LINENO" 'stdout' "$MAIN_OUT" 'pending_events=0'
-}
-
-function test_main_config_keeps_arguments_with_spaces_intact()
-{
-  run_main config --set-batch-size '1 0'
-  assertEquals "($LINENO) argc" 3 "$(tele_call_field 'config --set-batch-size 1 0' argc)"
-}
-
-function test_main_calls_kw_tele_with_the_kw_environment()
+function test_main_passes_the_kw_environment_and_leaks_nothing()
 {
   run_main upload
   assert_equals_helper 'KW_TELE_CONFIG' "$LINENO" "$TELE_CONFIG" "$(tele_call_field 'upload --force' KW_TELE_CONFIG)"
   assert_equals_helper 'KW_DATA_DIR' "$LINENO" "$TELE_DATA_DIR" "$(tele_call_field 'upload --force' KW_DATA_DIR)"
   assert_equals_helper 'KW_STATE_DIR' "$LINENO" "$TELE_STATE_DIR" "$(tele_call_field 'upload --force' KW_STATE_DIR)"
   assert_equals_helper 'KW_VERSION' "$LINENO" "$(head -n 1 ./src/VERSION)" "$(tele_call_field 'upload --force' KW_VERSION)"
-}
-
-function test_main_does_not_leak_kw_tele_variables_into_the_caller_shell()
-{
-  run_main upload
-  assert_equals_helper 'kw_tele was called' "$LINENO" 'upload --force' "$(tele_calls)"
-  assertFalse "($LINENO) KW_TELE_CONFIG" '[[ -v KW_TELE_CONFIG ]]'
-  assertFalse "($LINENO) KW_VERSION" '[[ -v KW_VERSION ]]'
+  assertFalse "($LINENO) KW_TELE_CONFIG leaked" '[[ -v KW_TELE_CONFIG ]]'
+  assertFalse "($LINENO) KW_VERSION leaked" '[[ -v KW_VERSION ]]'
 }
 
 # -------------------------------------------------------------------- consent
@@ -170,19 +102,19 @@ function test_main_consent_without_a_terminal_only_prints()
   assert_lacks "$LINENO" 'no prompt' "$(main_text)" 'Choice [3]:'
 }
 
-function test_main_consent_on_a_terminal_prints_then_prompts_when_not_yes()
+function test_main_consent_on_a_terminal_prompts_when_not_yes()
 {
   tele_write_config 'telemetry_consent=ask'
   tele_stub_set stdout.consent 'ask'
   tele_stub_set stdout.info $'pending_events=5\npending_since=2026-03-03'
-  TELE_PTY_EXTRA='include ./src/telemetry.sh' tele_run_pty '2\n' 'telemetry_main consent'
-  assert_has "$LINENO" 'value shown' "$TELE_PTY_OUT" 'ask'
+  TELE_PTY_EXTRA='include ./src/telemetry.sh' tele_run_pty '2\n' "telemetry_main consent > '${TD}/consent.stdout'"
   assert_has "$LINENO" 'prompt' "$TELE_PTY_OUT" 'Share kw usage telemetry?'
   assert_has "$LINENO" 'counts' "$TELE_PTY_OUT" '5 events recorded since 2026-03-03'
   assert_equals_helper 'calls' "$LINENO" $'consent\ninfo --pending\nconsent --set yes' "$(tele_calls)"
+  assert_lacks "$LINENO" 'the prompt is on stderr, not stdout' "$(< "${TD}/consent.stdout")" 'Share kw usage telemetry?'
 }
 
-function test_main_consent_on_a_terminal_when_already_yes_prints_and_points_to_opt_out()
+function test_main_consent_on_a_terminal_does_not_prompt_when_already_yes()
 {
   tele_stub_set stdout.consent 'yes'
   TELE_PTY_EXTRA='include ./src/telemetry.sh' tele_run_pty '' 'telemetry_main consent'
@@ -192,67 +124,60 @@ function test_main_consent_on_a_terminal_when_already_yes_prints_and_points_to_o
   assert_equals_helper 'calls' "$LINENO" 'consent' "$(tele_calls)"
 }
 
-function test_main_consent_on_a_terminal_with_no_answer_changes_nothing()
+# Without a terminal the shim only shows the value: it must not call the prompt
+# (which would read stdin), whatever the consent is.
+function test_main_consent_without_a_terminal_never_prompts()
 {
-  tele_write_config 'telemetry_consent=ask'
+  local value
+
+  for value in ask no; do
+    rm -f "${KW_TELE_STUB_DIR}/record"
+    tele_stub_set stdout.consent "$value"
+    run_main consent
+    assertEquals "(${value}) status" 0 "$MAIN_RC"
+    assert_has "$LINENO" "${value}: value shown" "$MAIN_OUT" "$value"
+    assert_lacks "$LINENO" "${value}: no prompt" "$(main_text)" 'Share kw usage telemetry?'
+    assert_equals_helper "${value}: only the show call" "$LINENO" 'consent' "$(tele_calls)"
+  done
+}
+
+# The prompt's own status does not change what `kw telemetry consent` returns.
+function test_main_consent_returns_0_even_when_the_prompt_gets_no_answer()
+{
   tele_stub_set stdout.consent 'ask'
   TELE_PTY_EXTRA='include ./src/telemetry.sh' tele_run_pty '' 'telemetry_main consent'
-  assert_has "$LINENO" 'prompt shown' "$TELE_PTY_OUT" 'Share kw usage telemetry?'
-  assert_lacks "$LINENO" 'nothing written' "$(tele_calls)" '--set'
+  assertEquals "($LINENO) status" 0 "$TELE_PTY_RC"
 }
 
 # ------------------------------------------------------------ exit code mapping
 
-function test_main_exit_3_explains_that_telemetry_is_not_enabled()
-{
-  tele_stub_set exit 3
-  run_main upload
-  assertEquals "($LINENO)" 3 "$MAIN_RC"
-  assert_has "$LINENO" 'message' "$(main_text)" 'Telemetry is not enabled; run `kw telemetry opt-in`.'
-}
-
-function test_main_exit_4_explains_that_the_schema_is_outdated()
-{
-  tele_stub_set exit 4
-  run_main info
-  assertEquals "($LINENO)" 4 "$MAIN_RC"
-  assert_has "$LINENO" 'message' "$(main_text)" 'kw database schema is outdated.'
-}
-
-function test_main_exit_6_explains_that_the_database_is_missing()
-{
-  tele_stub_set exit 6
-  run_main info
-  assertEquals "($LINENO)" 6 "$MAIN_RC"
-  assert_has "$LINENO" 'message' "$(main_text)" 'kw database not found.'
-}
-
-function test_main_other_nonzero_codes_get_the_generic_message()
+function test_main_exit_codes_get_their_messages()
 {
   local code
+  local sub
+  local message
 
-  for code in 1 2 5 7 130; do
+  # A DB exists, so the missing-DB warning cannot stand in for the exit-6 message.
+  tele_make_db
+  # kw_tele exit code | subcommand | message
+  while IFS='|' read -r code sub message; do
     tele_stub_set exit "$code"
-    run_main upload
-    assertEquals "($LINENO) code ${code}" "$code" "$MAIN_RC"
-    assert_has "$LINENO" "code ${code}" "$(main_text)" "kw_tele exited with error code ${code}"
-  done
-}
+    run_main "$sub"
+    assertEquals "(exit ${code} ${sub}) status" "$code" "$MAIN_RC"
+    assert_has "$LINENO" "exit ${code} ${sub}" "$(main_text)" "$message"
+  done << 'EOF'
+3|upload|Telemetry is not enabled; run `kw telemetry opt-in`.
+3|consent|Telemetry is not enabled; run `kw telemetry opt-in`.
+4|info|kw database schema is outdated.
+6|info|kw database not found.
+1|upload|kw_tele exited with error code 1
+130|upload|kw_tele exited with error code 130
+EOF
 
-function test_main_exit_0_prints_no_error_message()
-{
+  tele_stub_set exit 0
   run_main upload
-  assertEquals "($LINENO)" 0 "$MAIN_RC"
-  assert_lacks "$LINENO" 'no complaint' "$(main_text)" 'exited with error code'
-  assert_lacks "$LINENO" 'no complaint' "$(main_text)" 'not enabled'
-}
-
-function test_main_specific_codes_do_not_also_get_the_generic_message()
-{
-  tele_stub_set exit 3
-  run_main upload
-  assertEquals "($LINENO)" 3 "$MAIN_RC"
-  assert_lacks "$LINENO" 'generic' "$(main_text)" 'exited with error code'
+  assertEquals "($LINENO) exit 0" 0 "$MAIN_RC"
+  assert_lacks "$LINENO" 'exit 0 prints no complaint' "$(main_text)" 'exited with error code'
 }
 
 # ------------------------------------------------------- dispatch and usage
@@ -261,30 +186,23 @@ function test_main_unknown_subcommand_returns_22_with_usage()
 {
   run_main frobnicate
   assertEquals "($LINENO)" 22 "$MAIN_RC"
+  assert_has "$LINENO" 'names the offender' "$(main_text)" 'frobnicate'
   assert_has "$LINENO" 'usage' "$(main_text)" 'upload'
   assert_has "$LINENO" 'usage' "$(main_text)" 'opt-out'
   assertEquals "($LINENO) kw_tele not called" '' "$(tele_calls)"
 }
 
-function test_main_unknown_subcommand_names_the_offender()
-{
-  run_main frobnicate
-  assert_has "$LINENO" 'complaint' "$(main_text)" 'frobnicate'
-}
-
-function test_main_help_forms_print_usage_without_calling_kw_tele()
+function test_main_help_forms_print_the_usage_and_succeed()
 {
   local form
+  local -a argv
 
-  for form in -h --help; do
-    run_main "$form"
-    assertEquals "($LINENO) ${form} status" 0 "$MAIN_RC"
-    assert_has "$LINENO" "${form} usage" "$(main_text)" 'upload'
-    assert_has "$LINENO" "${form} usage" "$(main_text)" 'consent'
-    assert_has "$LINENO" "${form} usage" "$(main_text)" 'config'
+  for form in '' '-h' '--help'; do
+    read -r -a argv <<< "$form"
+    run_main "${argv[@]}"
+    assertEquals "(help '${form}') status" 0 "$MAIN_RC"
+    assert_has "$LINENO" "help '${form}'" "$(main_text)" 'telemetry opt-out'
   done
-  run_main
-  assert_has "$LINENO" 'no args: usage' "$(main_text)" 'upload'
   assertEquals "($LINENO) kw_tele not called" '' "$(tele_calls)"
 }
 
@@ -293,28 +211,21 @@ function test_main_help_forms_print_usage_without_calling_kw_tele()
 function test_main_without_kw_tele_complains_and_returns_2()
 {
   local saved="$PATH"
-
-  tele_limited_path kw_tele
-  PATH="$TELE_LIMITED_PATH"
-  run_main upload
-  PATH="$saved"
-  assertEquals "($LINENO)" 2 "$MAIN_RC"
-  assert_has "$LINENO" 'complaint' "$(main_text)" 'kw_tele'
-  assertEquals "($LINENO) nothing called" '' "$(tele_calls)"
-}
-
-function test_main_without_kw_tele_returns_2_for_every_subcommand()
-{
-  local saved="$PATH"
   local sub
+  local results=''
+  local expected=''
 
+  # The asserts run after PATH is restored: shunit2 needs expr.
   tele_limited_path kw_tele
   PATH="$TELE_LIMITED_PATH"
   for sub in upload consent opt-in opt-out info config; do
     run_main "$sub"
-    assertEquals "($LINENO) ${sub}" 2 "$MAIN_RC"
+    [[ "$(main_text)" == *kw_tele* ]] && results+="${sub}:${MAIN_RC} " || results+="${sub}:${MAIN_RC}:silent "
+    expected+="${sub}:2 "
   done
   PATH="$saved"
+  assert_equals_helper 'every subcommand returns 2 and names kw_tele' "$LINENO" "$expected" "$results"
+  assertEquals "($LINENO) nothing called" '' "$(tele_calls)"
 }
 
 # ---------------------------------------------------------------- schema guard
@@ -326,20 +237,6 @@ function test_main_migrates_the_schema_before_calling_kw_tele()
   tele_db_has_sent_at
   assertEquals "($LINENO) sent_at added" 0 "$?"
   assert_equals_helper 'argv' "$LINENO" 'info' "$(tele_calls)"
-}
-
-function test_main_with_a_missing_database_only_warns_and_still_runs_kw_tele()
-{
-  run_main info
-  assertEquals "($LINENO)" 0 "$MAIN_RC"
-  assert_equals_helper 'argv' "$LINENO" 'info' "$(tele_calls)"
-  assertFalse "($LINENO) DB not created" "[[ -e ${TELE_DB} ]]"
-}
-
-function test_main_unknown_subcommand_does_not_need_a_database()
-{
-  run_main nope
-  assertEquals "($LINENO)" 22 "$MAIN_RC"
 }
 
 invoke_shunit

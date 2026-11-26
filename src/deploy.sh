@@ -22,6 +22,7 @@ include "${KW_LIB_DIR}/lib/kw_config_loader.sh"
 include "${KW_LIB_DIR}/lib/remote.sh"
 include "${KW_LIB_DIR}/lib/signal_manager.sh"
 include "${KW_LIB_DIR}/transition_functions.sh"
+include "${KW_LIB_DIR}/build.sh"
 
 # To make the deploy to a remote machine straightforward, we create a directory
 # on the host that will be used for centralizing files required for the new
@@ -80,6 +81,7 @@ function deploy_main()
   local list_all
   local setup
   local flag
+  local no_modules=''
   local modules_install_status
   local env_name
   local output_kbuild_path=''
@@ -259,6 +261,9 @@ function deploy_main()
     return "$?"
   fi
 
+  # a package may not match the local .config
+  [[ -n "${options_values['FROM_PACKAGE']}" ]] && no_modules='none'
+
   # Full deploy
   if [[ "$modules" == 0 ]]; then
     start=$(date +%s)
@@ -269,9 +274,9 @@ function deploy_main()
     runtime=$((end - start))
 
     if [[ "$ret" == 0 ]]; then
-      statistics_manager 'deploy' "$start" "$runtime" '' "$flag"
+      build_modules_record "$start" "$runtime" "$flag" deploy success "$no_modules"
     else
-      statistics_manager 'deploy' "$start" "$runtime" 'failure' "$flag"
+      build_modules_record "$start" "$runtime" "$flag" deploy failure "$no_modules"
       exit "$ret"
     fi
   else # Only module deploy
@@ -282,9 +287,9 @@ function deploy_main()
     runtime=$((end - start))
 
     if [[ "$ret" == 0 ]]; then
-      statistics_manager 'modules_deploy' "$start" "$runtime" '' "$flag"
+      build_modules_record "$start" "$runtime" "$flag" modules_deploy success "$no_modules"
     else
-      statistics_manager 'modules_deploy' "$start" "$runtime" 'failure' "$flag"
+      build_modules_record "$start" "$runtime" "$flag" modules_deploy failure "$no_modules"
     fi
   fi
 

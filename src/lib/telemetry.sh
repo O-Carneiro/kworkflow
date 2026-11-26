@@ -198,11 +198,11 @@ function telemetry_kw_tele()
 
 # Ask the user, on the terminal, whether to share usage telemetry, and record
 # the answer with kw_tele. Nothing is written when there is no terminal, when
-# the answer is invalid three times or on EOF: that is not a refusal.
+# an answer is EOF: that is not a refusal.
 #
 # Return:
-# 1 if nothing was asked or no valid answer was given; otherwise the status of
-# the kw_tele call that recorded the answer
+# 1 if nothing was asked or on EOF; otherwise the status of the kw_tele call
+# that recorded the answer
 function telemetry_prompt_consent()
 {
   local -A prompt_config=()
@@ -212,12 +212,19 @@ function telemetry_prompt_consent()
   local since=''
   local past_data='no past data recorded'
   local answer
-  local attempt
+  local -a reminder=()
+  local confirming=0
+  local status
 
   [[ -t 0 && -t 2 ]] || return 1 # EPERM
 
   telemetry_paths
   telemetry_load_config prompt_config
+  reminder=(
+    'To see what is or would be sent, run `kw telemetry info`. To see the JSON of'
+    'the next batch without sending it, run `kw telemetry upload --dry-run`. To'
+    "choose what is not sent, set \`exclude_fields\` in ${TELEMETRY_CONFIG}."
+  )
   telemetry_ensure_schema
 
   info="$(telemetry_kw_tele info --pending 2> /dev/null)" || info=''
@@ -246,36 +253,55 @@ function telemetry_prompt_consent()
     '    `kw telemetry opt-in`.' \
     '' >&2
 
-  for ((attempt = 0; attempt < 3; attempt++)); do
-    printf '%s\n' \
-      'Share kw usage telemetry?' \
-      "  1) Yes, including past data (${past_data})" \
-      '  2) Yes, only from now on' \
-      '  3) No' >&2
-    printf '%s' 'Choice [3]: ' >&2
+  printf '%s\n' \
+    'Share kw usage telemetry?' \
+    "  1) Yes, including past data (${past_data})" \
+    '  2) Yes, only from now on' \
+    '  3) No' \
+    '' \
+    "${reminder[@]}" \
+    '' >&2
+  printf '%s' 'Choice [3]: ' >&2
 
+  while :; do
     read -r answer || return 1 # EPERM
     answer="${answer#"${answer%%[![:space:]]*}"}"
     answer="${answer%"${answer##*[![:space:]]}"}"
 
-    case "${answer:-3}" in
-      1)
-        telemetry_kw_tele consent --set yes --include-history
-        return "$?"
-        ;;
-      2)
-        telemetry_kw_tele consent --set yes
-        return "$?"
-        ;;
-      3)
-        telemetry_kw_tele consent --set no
-        return "$?"
-        ;;
+    if [[ "$confirming" == 1 && -z "$answer" ]]; then
+      answer=3
+    fi
+    case "$answer" in
+      1 | 2 | 3) break ;;
     esac
-    printf '%s\n' 'Please answer 1, 2 or 3.' >&2
+
+    # not an option number: show the refusal that Enter would record
+    confirming=1
+    printf '%s\n' \
+      '' \
+      'Answer: 3' \
+      'You will refuse telemetry collection. Press Enter to confirm, or type 1 or 2.' >&2
+    printf '%s' '> ' >&2
   done
 
-  return 1 # EPERM
+  case "$answer" in
+    1)
+      telemetry_kw_tele consent --set yes --include-history
+      ;;
+    2)
+      telemetry_kw_tele consent --set yes
+      ;;
+    *)
+      telemetry_kw_tele consent --set no
+      ;;
+  esac
+  status="$?"
+
+  printf '%s\n' \
+    '' \
+    'To change your choice, run `kw telemetry opt-in` or `kw telemetry opt-out`.' \
+    "${reminder[@]}" >&2
+  return "$status"
 }
 
 # Start an upload in a detached session. telemetry.spawn is written first: it
@@ -327,9 +353,7 @@ function telemetry_gate()
   local gap_cap
   local count
 
-  case "$action" in
-    '' | telemetry | help | h | --help | -h | man | version | --version | -v) return 0 ;;
-  esac
+  [[ "$action" == telemetry ]] && return 0
 
   command -v kw_tele > /dev/null 2>&1 || return 0
 
@@ -341,6 +365,11 @@ function telemetry_gate()
       telemetry_prompt_consent >&2
       return 0
       ;;
+  esac
+
+  # these actions never record events, so they neither upload nor spawn
+  case "$action" in
+    '' | help | h | --help | -h | man | version | --version | -v) return 0 ;;
   esac
 
   telemetry_read_kv "$TELEMETRY_STATE" state

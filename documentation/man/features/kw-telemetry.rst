@@ -21,7 +21,18 @@ consent, `kw telemetry` uploads these events to a collector, so the developers
 can learn how kw is used. Nothing is sent without consent, and the first time
 kw runs on a terminal, it asks one question with three answers: share
 including the events recorded so far, share only from now on, or do not share.
-Without a terminal, kw does not ask and sends nothing.
+Answering 1, 2 or 3 records the choice at once. Any other input, Enter
+included, is shown as 3 and kw asks for confirmation: Enter records that you
+do not share, and 1, 2 or 3 records that choice. Any other input repeats the
+confirmation. If the input ends (EOF or Ctrl-C), nothing is recorded and kw
+asks again the next time. After an answer, kw tells how to change it
+(`kw telemetry opt-in` or `kw telemetry opt-out`), how to see what is or would be sent
+(`kw telemetry info`), how to print the JSON of the next batch without sending
+it (`kw telemetry upload --dry-run`) and how to choose what is not sent
+(`exclude_fields` in the config file). kw asks only when `kw_tele` is
+installed and both the standard input and the standard error are terminals; otherwise it does not ask and sends nothing. It
+asks before any command except `kw telemetry`, including `kw help` and
+`kw version`.
 
 Each installation has a random ID, generated when you opt in. The uploads run
 in the background, at most once per backoff period, when the upload interval
