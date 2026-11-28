@@ -56,7 +56,7 @@ declare -r DOCS_VIRTUAL_ENV='docs_virtual_env'
 declare -r PATCH_HUB_LATEST_RELEASE='https://github.com/kworkflow/patch-hub/releases/latest/download/patch-hub-x86_64-unknown-linux-gnu.tar.xz'
 
 # kw_tele latest release endpoint
-declare -r KW_TELE_LATEST_RELEASE='https://github.com/O-Carneiro/tcc-public/releases/latest/download/kw_tele'
+declare -r KW_TELE_LATEST_RELEASE='https://github.com/O-Carneiro/kw_telemetry/releases/latest/download/kw_tele'
 
 # This function identifies the missing packages required by the distribution.
 #
